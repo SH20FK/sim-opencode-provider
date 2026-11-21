@@ -841,6 +841,37 @@ function statusRows(cfg, health, oc, st) {
 }
 
 // -------------------------------------------------------------------- menu
+async function moreMenu(cfg) {
+  for (;;) {
+    clear()
+    banner()
+    console.log(paint('bold', '\n  Ещё\n'))
+    menuGrid([
+      ['1', 'Статус подробно'],
+      ['2', 'Тест запроса'],
+      ['3', 'Метрики за час'],
+      ['4', 'Бенчмарк'],
+      ['5', 'OpenCode'],
+      ['0', 'Назад'],
+    ])
+    const choice = (await ask('\n  Выбор', '0')).toLowerCase()
+    if (choice === '1') {
+      await showStatus(cfg)
+      await ask('  Enter — продолжить')
+    } else if (choice === '2') {
+      await quickTest(cfg)
+      await ask('\n  Enter — продолжить')
+    } else if (choice === '3') {
+      await showMetrics(cfg)
+      await ask('  Enter — продолжить')
+    } else if (choice === '4') {
+      await runBenchCommand(cfg, [])
+      await ask('\n  Enter — продолжить')
+    } else if (choice === '5') await opencodeMenu(cfg)
+    else if (choice === '0' || choice === 'q') return
+  }
+}
+
 async function menu(cfg) {
   for (;;) {
     const health = await alive(cfg)
@@ -857,13 +888,9 @@ async function menu(cfg) {
     menuGrid([
       ['1', health ? 'Перезапустить' : 'Запустить'],
       ['2', 'Остановить'],
-      ['3', 'Статус и статистика'],
-      ['4', 'Подключить к OpenCode'],
-      ['5', 'Тест запроса'],
-      ['6', 'Настройки'],
-      ['7', 'Логи'],
-      ['8', 'Бенчмарк'],
-      ['9', 'Метрики за час'],
+      ['3', 'Логи'],
+      ['4', 'Настройки'],
+      ['5', 'Ещё'],
       ['0', 'Выход'],
     ])
     const choice = (await ask('\n  Выбор', 'Q')).toLowerCase()
@@ -876,23 +903,11 @@ async function menu(cfg) {
       await stopServer(cfg)
       await ask('\n  Enter — продолжить')
     } else if (choice === '3') {
-      await showStatus(cfg)
-      await ask('  Enter — продолжить')
-    } else if (choice === '4') await opencodeMenu(cfg)
-    else if (choice === '5') {
-      await quickTest(cfg)
-      await ask('\n  Enter — продолжить')
-    } else if (choice === '6') cfg = await settingsMenu(cfg)
-    else if (choice === '7') {
       tailLog()
       await ask('\n  Enter — продолжить')
-    } else if (choice === '8') {
-      await runBenchCommand(cfg, [])
-      await ask('\n  Enter — продолжить')
-    } else if (choice === '9') {
-      await showMetrics(cfg)
-      await ask('  Enter — продолжить')
-    } else if (choice === 'q' || choice === '0') return
+    } else if (choice === '4') cfg = await settingsMenu(cfg)
+    else if (choice === '5') await moreMenu(cfg)
+    else if (choice === 'q' || choice === '0') return
   }
 }
 
