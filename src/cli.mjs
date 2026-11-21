@@ -44,24 +44,27 @@ const ok = (s) => console.log(`${paint('green', '✓')} ${s}`)
 const bad = (s) => console.log(`${paint('red', '✗')} ${s}`)
 const warn = (s) => console.log(`${paint('yellow', '!')} ${s}`)
 const info = (s) => console.log(paint('gray', s))
-const clear = () => process.stdout.write('\x1b[2J\x1b[0f')
+// Clear the viewport and the scrollback: a redraw must never leave old frames
+// above, otherwise the header ends up out of sight after a run.
+const clear = () => process.stdout.write('\x1b[2J\x1b[3J\x1b[0f')
 
-const SPLASH = process.env.SIM_CLI_SPLASH === '1'
+// The bat files used to echo this banner and then the panel cleared it away.
+// The CLI owns the screen now, so the art is drawn after every clear.
+const LOGO = [
+  '   ===========================================================================',
+  '   ####  ###  #   #      ###   ####   #####  #   #   ####   ###   ####   #####',
+  '   #      #   ## ##     #   #  #   #  #      ##  #  #      #   #  #   #  #',
+  '   ###    #   # # #     #   #  ####   ###    # # #  #      #   #  #   #  ###',
+  '      #   #   #   #     #   #  #      #      #  ##  #      #   #  #   #  #',
+  '   ####  ###  #   #      ###   #      #####  #   #   ####   ###   ####   #####',
+  '   ===========================================================================',
+]
 
-function banner() {
-  if (SPLASH) return
-  const W = 60
-  const row = (left, right = '') => {
-    const pad = W - left.length - right.length
-    return paint('cyan', '│') + '  ' + left + ' '.repeat(Math.max(1, pad)) + right + '  ' + paint('cyan', '│')
-  }
-  const top = paint('cyan', '┌' + '─'.repeat(W + 4) + '┐')
-  const bottom = paint('cyan', '└' + '─'.repeat(W + 4) + '┘')
+function banner(subtitle = 'free hosted models | tool-calling emulation | local proxy') {
   console.log('')
-  console.log(top)
-  console.log(row(`${C.bold}SIM  →  OPENCODE${C.reset}`, `${C.gray}v${VERSION}${C.reset}`))
-  console.log(row(`${C.gray}free hosted models · tool-calling emulation${C.reset}`))
-  console.log(bottom)
+  console.log(LOGO.join('\n'))
+  console.log(`   ${paint('gray', `${subtitle}   v${VERSION}`)}`)
+  console.log('')
 }
 
 // ------------------------------------------------------------------ helpers
@@ -272,7 +275,7 @@ async function smokeTest(key, workspaceId, model = 'claude-sonnet-5-5') {
 // ------------------------------------------------------------------- setup
 async function setupWizard(existing) {
   clear()
-  banner()
+  banner('setup wizard | first run')
   console.log(paint('bold', '\n  Мастер настройки'))
   info('  Ключ: sim.ai → Settings → API keys (начинается с sk-sim-)')
   info('  Ключ сохраняется только локально, в config.json.\n')
