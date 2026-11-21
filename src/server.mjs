@@ -114,6 +114,7 @@ const stats = {
   fallbacks: 0,
   upstreamRetries: 0,
   unparsedCalls: 0,
+  duplicateCalls: 0,
   brFloods: 0,
   dedupedResults: 0,
   lastErrors: [],
@@ -1290,10 +1291,14 @@ async function handleChat(req, res) {
           if (calls) {
             calls = repairCalls(calls, tools)
             content = stripToolArtifacts(content)
-          } else if (/"tool_calls"\s*:/.test(content)) {
-            // Useful when a model invents a JSON shape the parser cannot read.
+          } else if (/"tool_calls"\s*:/.test(content) || /^\s*[{[]/.test(content)) {
+            // Useful when a model invents a JSON shape the parser cannot read,
+            // or calls a tool the client never offered.
             stats.unparsedCalls = (stats.unparsedCalls || 0) + 1
-            log(`unparsed tool call from ${model}: ${content.length} chars, head=${short(content.replace(/\s+/g, ' '), 140)}`)
+            const names = clientTools.map((t) => (t.function || t).name).join(',')
+            log(
+              `unparsed tool call from ${model}: ${content.length} chars, head=${short(content.replace(/\s+/g, ' '), 160)} · client tools=${names}`,
+            )
           }
         }
 
@@ -1349,10 +1354,20 @@ async function handleChat(req, res) {
             bump(model, Date.now() - startedAll, (retry.tokens && retry.tokens.input) || 0, (retry.tokens && retry.tokens.output) || 0)
             content = retry.content
             tokens = retry.tokens
+            // If the model repeated the call anyway, its JSON must never reach
+            // the chat as text: strip it and answer with what prose is left.
+            const repeat = emulation
+              ? extractJsonCalls(content, tools) || extractXmlCalls(content, tools) || extractCallLines(content, tools) || extractBareInvokes(content, tools)
+              : null
+            if (repeat) {
+              stats.duplicateCalls = (stats.duplicateCalls || 0) + 1
+              content = stripToolArtifacts(content)
+            }
           } else {
             // Never hand the client the same tool calls again: it would run them twice.
-            content = 'Не удалось продолжить после повторного вызова инструмента. Попробуй ещё раз.'
+            content = ''
           }
+          if (!content) content = 'Повторный вызов не выполнен, чтобы не выполнить его дважды. Скажи «продолжай».'
           break
         }
         calls = fresh
