@@ -1158,7 +1158,7 @@ async function handleChat(req, res) {
 
   const id = newId()
   const created = Math.floor(Date.now() / 1000)
-  const streamed = { chars: 0, active: false, decided: false }
+  const streamed = { chars: 0, text: '', decided: false }
 
   // Sim returns a part whole, so without pacing the client gets one wall of
   // text per call. Sending it in small slices makes it read like typing.
@@ -1192,25 +1192,26 @@ async function handleChat(req, res) {
   // three minutes does not look frozen. Tool calls are never streamed.
   const onPart = async (text) => {
     if (!body.stream || !text) return
+    // Decide per part, not once: a reply can start with prose and put the tool
+    // call in a later part. Streaming that call would show raw JSON/XML.
+    if (emulation && tools.length) {
+      const partCalls =
+        extractJsonCalls(text, tools) ||
+        extractXmlCalls(text, tools) ||
+        extractCallLines(text, tools) ||
+        extractBareInvokes(text, tools)
+      if (partCalls) return
+    }
     if (!streamed.decided) {
       streamed.decided = true
-      const head = text.trimStart()
-      const looksLikeCall =
-        head.startsWith('{') ||
-        head.startsWith('```') ||
-        /^<(invoke|function_calls|antml)/.test(head) ||
-        /"tool_calls"\s*:/.test(head.slice(0, 200))
-      streamed.active = !looksLikeCall
-      if (streamed.active) {
-        sendSse(res, {
-          id, object: 'chat.completion.chunk', created, model,
-          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-        })
-      }
+      sendSse(res, {
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+      })
     }
-    if (!streamed.active) return
     await sendContent(text)
     streamed.chars += text.length
+    streamed.text += text
   }
 
   let cacheState = 'off'
@@ -1489,12 +1490,14 @@ async function handleChat(req, res) {
 
   if (body.stream) {
     const text = content || ''
-    if (!streamed.chars) {
+    if (!streamed.text) {
       sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
       await sendContent(text)
     } else {
-      // Everything up to streamed.chars already went out part by part.
-      await sendContent(text.slice(streamed.chars))
+      // Everything the client already has went out part by part. If the content
+      // was replaced by a retry, the prefix no longer matches and it is sent whole.
+      const rest = text.startsWith(streamed.text) ? text.slice(streamed.text.length) : text
+      await sendContent(rest)
     }
     sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage })
     res.write('data: [DONE]\n\n')
