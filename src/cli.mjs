@@ -519,15 +519,26 @@ async function runBenchCommand(cfg, args = []) {
     },
   )
 
+  let finalRows = rows
+  if (args.includes('--merge')) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(path.join(ROOT, 'bench.json'), 'utf8'))
+      const map = new Map(prev.map((r) => [r.model, r]))
+      for (const r of rows) map.set(r.model, r)
+      finalRows = [...map.values()]
+      info(`  дозапись: обновлено ${rows.length}, всего ${finalRows.length}`)
+    } catch {}
+  }
+
   const out = defaultDesktopPath()
   try {
-    writeTable(rows, out)
+    writeTable(finalRows, out)
     ok(`таблица: ${out}`)
   } catch (err) {
     bad(`Не смог записать таблицу: ${err.message}`)
   }
   try {
-    fs.writeFileSync(path.join(ROOT, 'bench.json'), JSON.stringify(rows, null, 2) + '\n')
+    fs.writeFileSync(path.join(ROOT, 'bench.json'), JSON.stringify(finalRows, null, 2) + '\n')
     info('  сырые данные: bench.json')
   } catch {}
   ok(`готово за ${Math.round((Date.now() - t0) / 60000)} мин`)

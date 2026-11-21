@@ -96,6 +96,7 @@ async function benchOne(model, ctx) {
       outputTokens: outTokens,
       chars,
       tokPerSec: seconds > 0 ? Math.round((outTokens / seconds) * 10) / 10 : 0,
+      textTokPerSec: seconds > 0 ? Math.round((chars / 4 / seconds) * 10) / 10 : 0,
       reasoningPct:
         outTokens > 0 ? Math.max(0, Math.round((1 - chars / 4 / outTokens) * 100)) : null,
     }
@@ -191,6 +192,7 @@ export function renderTableHtml(rows, meta = {}) {
         <td>${price}</td>
         <td>${sp.seconds ?? '—'}</td>
         <td>${sp.tokPerSec ?? '—'}</td>
+        <td>${sp.textTokPerSec ?? '—'}</td>
         <td>${sp.reasoningPct != null ? `${sp.reasoningPct}%` : '—'}</td>
         <td class="${toolMark === '✓' ? 'ok' : toolMark === '✗' ? 'bad' : ''}" title="${esc(toolTitle)}">${esc(toolMark)}</td>
         <td class="${jsonMark === '✓' ? 'ok' : jsonMark === '✗' ? 'bad' : ''}" title="${esc(jsonTitle)}">${jsonMark}</td>
@@ -209,29 +211,34 @@ export function renderTableHtml(rows, meta = {}) {
   body { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 32px; }
   h1 { font-size: 20px; margin: 0 0 4px; }
   .sub { opacity: .6; margin-bottom: 20px; }
-  table { border-collapse: collapse; width: 100%; max-width: 1100px; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid rgba(128,128,128,.25); white-space: nowrap; }
-  th { cursor: pointer; user-select: none; font-weight: 600; position: sticky; top: 0; background: Canvas; }
-  tr:hover td { background: rgba(128,128,128,.08); }
+  .wrap { overflow-x: auto; border: 1px solid rgba(128,128,128,.25); border-radius: 10px; max-width: 1180px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid rgba(128,128,128,.18); white-space: nowrap; }
+  th { cursor: pointer; user-select: none; font-weight: 600; position: sticky; top: 0; background: Canvas; z-index: 1; }
+  tbody tr:nth-child(even) td { background: rgba(128,128,128,.05); }
+  tbody tr:hover td { background: rgba(128,128,128,.13); }
+  td:nth-child(n+3):not(:last-child), th:nth-child(n+3):not(:last-child) { text-align: right; }
   td.m { font-family: ui-monospace, Consolas, monospace; }
   td.v { opacity: .8; }
   .ok { color: #1a7f37; }
   .bad { color: #cf222e; }
-  .hint { margin-top: 16px; opacity: .6; }
+  .hint { margin-top: 16px; opacity: .6; max-width: 1180px; }
 </style>
 </head>
 <body>
 <h1>Sim: hosted-модели</h1>
 <div class="sub">Замер ${when} · ${rows.length} моделей · ток/с и reasoning измерены на запросе ~150 слов · тул и JSON — через прокси</div>
+<div class="wrap">
 <table id="t">
   <thead><tr>
-    <th>модель</th><th>$/1M in / out</th><th>сек</th><th>tok/s</th><th>reasoning</th><th>тул</th><th>JSON</th><th>вердикт</th>
+    <th>модель</th><th>$/1M in / out</th><th>сек</th><th>tok/s</th><th>текст tok/s</th><th>reasoning</th><th>тул</th><th>JSON</th><th>вердикт</th>
   </tr></thead>
   <tbody>
 ${body}
   </tbody>
 </table>
-<div class="hint">Клик по заголовку — сортировка. «агент» = тул и JSON ок, скорость ≥ 25 tok/s. reasoning % — доля выходных токенов, ушедшая в размышления.</div>
+</div>
+<div class="hint">Клик по заголовку — сортировка. «агент» = тул и JSON ок, скорость ≥ 25 tok/s. tok/s считает все выходные токены, включая размышления; «текст tok/s» — только видимый текст. reasoning % — доля токенов, ушедшая в размышления.</div>
 <script>
 const t = document.getElementById('t')
 const dirs = new Map()
