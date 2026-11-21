@@ -470,6 +470,7 @@ async function runBenchCommand(cfg, args = []) {
     return
   }
   const all = args.includes('--all')
+  const everything = args.includes('--everything')
   const modelsArg = (args.find((a) => a.startsWith('--models=')) || '').slice('--models='.length)
   const limitArg = Number((args.find((a) => a.startsWith('--limit=')) || '').slice('--limit='.length)) || 0
   const concRaw = args.find((a) => a.startsWith('--concurrency='))
@@ -477,10 +478,12 @@ async function runBenchCommand(cfg, args = []) {
 
   let models = modelsArg
     ? modelsArg.split(',').map((s) => s.trim()).filter(Boolean)
-    : all
+    : everything
       ? ((await proxyFetch(cfg, '/v1/models?all=1')).body.data || []).map((m) => m.id)
-      : opencode.MODELS.map((m) => m.id)
-  if (!modelsArg && !all) {
+      : all
+        ? ((await proxyFetch(cfg, '/v1/models')).body.data || []).map((m) => m.id)
+        : opencode.MODELS.map((m) => m.id)
+  if (!modelsArg && !all && !everything) {
     // Bench only what the catalogue still serves: ids linger after Sim removes a model.
     const hosted = ((await proxyFetch(cfg, '/v1/models')).body.data || []).map((m) => m.id)
     if (hosted.length) models = models.filter((id) => hosted.includes(id))

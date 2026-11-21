@@ -87,7 +87,10 @@ export async function fetchHosted({ simApiKey, workspaceId }) {
     const body = await res.json()
     const field = ((body.data && body.data.inputSchema) || []).find((f) => f && f.id === 'model' && Array.isArray(f.options))
     if (!field) return null
-    const hosted = field.options.filter((o) => o.hosted).map((o) => o.id)
+    const hosted = field.options
+      .filter((o) => o.hosted)
+      .map((o) => o.id)
+      .filter((id) => !/^jev-/i.test(id))
     return hosted.length ? hosted : null
   } catch {
     return null

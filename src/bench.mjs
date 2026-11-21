@@ -2,6 +2,7 @@
 //
 //   node src/cli.mjs bench            # curated list
 //   node src/cli.mjs bench --all      # every hosted model
+//   node src/cli.mjs bench --everything # the whole catalogue (BYOK models included, mostly useless)
 //   node src/cli.mjs bench --models=a,b,c
 //
 // The speed probe talks to Sim directly (so it also gets the per-model price),

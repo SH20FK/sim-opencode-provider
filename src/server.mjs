@@ -189,7 +189,8 @@ async function refreshModels() {
     const field = ((body.data && body.data.inputSchema) || []).find((f) => f && f.id === 'model' && Array.isArray(f.options))
     if (!field) throw new Error('model field not found')
     const all = field.options.map((o) => o.id)
-    const hosted = field.options.filter((o) => o.hosted).map((o) => o.id)
+    // `jev-*` are evaluation models: Sim rejects chat requests against them.
+    const hosted = field.options.filter((o) => o.hosted).map((o) => o.id).filter((id) => !/^jev-/i.test(id))
     models = { at: Date.now(), hosted, all }
     fs.writeFileSync(MODELS_CACHE, JSON.stringify(models, null, 1))
     log(`catalog: ${hosted.length} hosted / ${all.length} total`)
@@ -507,7 +508,10 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
         // "Provider X is not available" is permanent: the model exists in the
         // catalogue but cannot be reached, so it must not be swapped silently.
         const timedOut = /timed?\s?out|timeout/i.test(text)
-        const unavailable = /is not available|no longer available|unknown model|api key is required|unsupported model/i.test(text)
+        const unavailable =
+          /is not available|no longer available|unknown model|api key is required|unsupported model|evaluation or chat modality|modality/i.test(
+            text,
+          )
         err.code = timedOut ? 'TIMEOUT' : unavailable ? 'UNAVAILABLE' : 'SIM_FAILED'
         err.status = timedOut ? 504 : unavailable ? 404 : 502
         throw err
