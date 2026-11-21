@@ -765,29 +765,107 @@ async function settingsMenu(cfg) {
   }
 }
 
+// -------------------------------------------------------------------- panel
+const pad = (s, n) => s + ' '.repeat(Math.max(0, n - s.length))
+
+// A rounded box; `rows` are { label, value, color }, padding is computed from
+// the plain value so ANSI colours do not break the right border.
+function card(title, rows, width = 66) {
+  const dashes = Math.max(4, width - title.length - 2)
+  console.log('  ' + paint('cyan', `┌ ${title} ${'─'.repeat(dashes)}┐`))
+  for (const row of rows) {
+    if (!row) continue
+    const value = String(row.value ?? '')
+    const fill = ' '.repeat(Math.max(0, width - 11 - value.length))
+    console.log(
+      '  ' +
+        paint('cyan', '│') +
+        ' ' +
+        paint('gray', pad(row.label, 10)) +
+        (row.color ? paint(row.color, value) : value) +
+        fill +
+        paint('cyan', '│'),
+    )
+  }
+  console.log('  ' + paint('cyan', '└' + '─'.repeat(width) + '┘'))
+}
+
+function menuGrid(items) {
+  const half = Math.ceil(items.length / 2)
+  const key = (k) => `${C.bold}${C.cyan}${k}${C.reset}`
+  for (let i = 0; i < half; i++) {
+    const a = items[i]
+    const b = items[i + half]
+    const left = `  ${key(a[0])}  ${pad(a[1], 26)}`
+    console.log(left + (b ? `${key(b[0])}  ${b[1]}` : ''))
+  }
+}
+
+function statusRows(cfg, health, oc, st) {
+  const rows = []
+  const up = Math.floor((health?.uptimeSec || 0) / 60)
+  rows.push({
+    label: 'прокси',
+    value: health ? `● работает · 127.0.0.1:${cfg.port}${up ? ` · ${up} мин` : ''}` : `○ остановлен · порт ${cfg.port}`,
+    color: health ? 'green' : 'red',
+  })
+  if (health) {
+    const cache = st?.cacheInfo
+    const cacheBit = cache ? ` · кеш ${cache.entries}` : ''
+    const reqs = st?.chatRequests ? ` · ${st.chatRequests} запросов` : ''
+    rows.push({ label: 'модели', value: `${health.models} · эмуляция ${health.toolEmulation ? 'вкл' : 'выкл'}${cacheBit}${reqs}` })
+  } else {
+    rows.push({ label: 'модели', value: '—', color: 'gray' })
+  }
+  rows.push({
+    label: 'OpenCode',
+    value: !oc.exists
+      ? 'конфиг не найден'
+      : oc.installed
+        ? `● подключён · ${oc.models} моделей`
+        : '○ не подключён',
+    color: !oc.exists ? 'yellow' : oc.installed ? 'green' : 'yellow',
+  })
+  if (st?.rateLimit && st.rateLimit.waitMs > 0) {
+    rows.push({ label: 'лимит Sim', value: `ждём окно ещё ${Math.ceil(st.rateLimit.waitMs / 1000)} с`, color: 'yellow' })
+  }
+  if (Array.isArray(st?.inflight) && st.inflight.length) {
+    const first = st.inflight[0]
+    rows.push({
+      label: 'в работе',
+      value: `${first.model} · ${Math.round(first.elapsedMs / 1000)} с${st.inflight.length > 1 ? ` (+${st.inflight.length - 1})` : ''}`,
+      color: 'cyan',
+    })
+  }
+  return rows
+}
+
 // -------------------------------------------------------------------- menu
 async function menu(cfg) {
   for (;;) {
     const health = await alive(cfg)
-    const st = opencode.inspect()
+    const oc = opencode.inspect()
+    const st = health ? (await proxyFetch(cfg, '/stats')).body : null
     clear()
     banner()
-    console.log(paint('gray', `  ${'─'.repeat(62)}`))
-    const dot = health ? paint('green', '● работает') : paint('red', '○ остановлен')
-    const oc = st.installed ? paint('green', 'подключён') : paint('yellow', 'не подключён')
-    console.log(`\n  ${dot}   :${cfg.port}   ${health ? health.models : '—'} моделей   OpenCode: ${oc}`)
-    info(`  ключ …${cfg.simApiKey ? cfg.simApiKey.slice(-6) : '—'}   воркспейс …${cfg.workspaceId ? cfg.workspaceId.slice(-6) : '—'}`)
-    console.log(`
-  ${paint('bold', '1')}  ${health ? 'Перезапустить' : 'Запустить'}
-  ${paint('bold', '2')}  Остановить
-  ${paint('bold', '3')}  Статус и статистика
-  ${paint('bold', '4')}  Подключить к OpenCode
-  ${paint('bold', '5')}  Тест запроса
-  ${paint('bold', '6')}  Настройки
-  ${paint('bold', '7')}  Логи
-  ${paint('bold', '8')}  Бенчмарк моделей → таблица на рабочий стол
-  ${paint('bold', '9')}  Метрики за последний час
-  ${paint('bold', 'Q')}  Выход`)
+    card('состояние', statusRows(cfg, health, oc, st))
+    console.log(
+      paint('gray', `  ключ …${cfg.simApiKey ? cfg.simApiKey.slice(-6) : '—'}`) +
+        paint('gray', `   воркспейс …${cfg.workspaceId ? cfg.workspaceId.slice(-6) : '—'}`),
+    )
+    console.log('')
+    menuGrid([
+      ['1', health ? 'Перезапустить' : 'Запустить'],
+      ['2', 'Остановить'],
+      ['3', 'Статус и статистика'],
+      ['4', 'Подключить к OpenCode'],
+      ['5', 'Тест запроса'],
+      ['6', 'Настройки'],
+      ['7', 'Логи'],
+      ['8', 'Бенчмарк'],
+      ['9', 'Метрики за час'],
+      ['0', 'Выход'],
+    ])
     const choice = (await ask('\n  Выбор', 'Q')).toLowerCase()
 
     if (choice === '1') {
