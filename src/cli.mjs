@@ -2,7 +2,7 @@
 //
 //   node src/cli.mjs                 panel (wizard on first run)
 //   node src/cli.mjs setup           configure API key / workspace
-//   node src/cli.mjs start|stop|restart|status|test|logs|models
+//   node src/cli.mjs start|stop|restart|status|stats|test|logs|models
 //   node src/cli.mjs opencode-install|opencode-remove|opencode-status
 //   node src/cli.mjs autostart-on|autostart-off
 
@@ -69,7 +69,7 @@ const DEFAULTS = {
   simApiKey: '', workspaceId: '', workflowId: '', port: 8787,
   toolEmulation: true, toolTemperature: 0, maxConcurrent: 2, requestTimeoutMs: 290000,
   fallbackModel: '',
-  cache: { enabled: true, ttlMs: 600000, maxEntries: 200 },
+  cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
   proxyTools: { now: true, web_fetch: true, web_search: true },
   nudge: { enabled: true, maxRetries: 2 },
   maxProxyToolHops: 3,
@@ -406,7 +406,8 @@ async function showStatus(cfg) {
       (st.chunkShrinks ? `  ·  урезано ${st.chunkShrinks}` : '') +
       `  ·  fallback ${st.fallbacks || 0}` +
       (st.emptyRetries ? `  ·  пустых повторов ${st.emptyRetries}` : '') +
-      (st.dedupedResults ? `  ·  дублей в контексте ${st.dedupedResults}` : ''),
+      (st.dedupedResults ? `  ·  дублей в контексте ${st.dedupedResults}` : '') +
+      (st.brFloods ? `  ·  чистил <br> ${st.brFloods}` : ''),
   )
   console.log(`  токенов ${st.tokensIn || 0} in / ${st.tokensOut || 0} out  ·  средняя ${avg} мс`)
   if (cred && cred.credits) {
@@ -449,6 +450,50 @@ async function showStatus(cfg) {
   if (Array.isArray(st.lastErrors) && st.lastErrors.length) {
     info('  последние ошибки:')
     for (const e of st.lastErrors.slice(0, 3)) info(`    ${String(e.at).slice(11, 19)}  ${e.message}`)
+  }
+  console.log()
+}
+
+async function showMetrics(cfg) {
+  const health = await alive(cfg)
+  if (!health) {
+    bad(`Прокси не запущен (порт ${cfg.port})`)
+    return
+  }
+  const st = (await proxyFetch(cfg, '/stats')).body || {}
+  const w = st.window || { models: [], requests: 0 }
+  const win = Math.round((w.windowMs || 3600000) / 60000)
+  console.log(paint('bold', `\n  За последние ${win} мин · запросов ${w.requests || 0}`))
+  if (st.cacheInfo) {
+    const c = st.cacheInfo
+    const kb = Math.round((c.bytes || 0) / 1024)
+    console.log(
+      `  кеш: ${c.enabled ? 'вкл' : 'выкл'} · ${c.entries} записей · ${kb} КБ` +
+        (c.persist ? ' · на диске' : '') +
+        (w.cacheHitRate !== null && w.cacheHitRate !== undefined ? ` · попаданий ${w.cacheHitRate}%` : ''),
+    )
+  }
+  if (!w.models || !w.models.length) {
+    info('  пока нет завершённых запросов')
+    console.log()
+    return
+  }
+  const name = (s) => (s.length > 28 ? `${s.slice(0, 27)}…` : s)
+  const head =
+    '  ' + 'модель'.padEnd(29) + 'запр'.padStart(6) + '429%'.padStart(7) + 'тайм%'.padStart(7) +
+    'p50'.padStart(8) + 'p95'.padStart(8) + 'ток'.padStart(7) + 'кеш%'.padStart(7)
+  console.log(paint('gray', head))
+  for (const m of w.models) {
+    const line =
+      '  ' + name(m.model).padEnd(29) +
+      String(m.requests).padStart(6) +
+      String(m.rateLimitedPct).padStart(7) +
+      String(m.timeoutPct).padStart(7) +
+      `${(m.p50Ms / 1000).toFixed(1)}с`.padStart(8) +
+      `${(m.p95Ms / 1000).toFixed(1)}с`.padStart(8) +
+      String(m.avgTokensOut).padStart(7) +
+      (m.cacheHitRate === null ? '—' : String(m.cacheHitRate)).padStart(7)
+    console.log(line)
   }
   console.log()
 }
@@ -738,6 +783,7 @@ async function menu(cfg) {
   ${paint('bold', '6')}  Настройки
   ${paint('bold', '7')}  Логи
   ${paint('bold', '8')}  Бенчмарк моделей → таблица на рабочий стол
+  ${paint('bold', '9')}  Метрики за последний час
   ${paint('bold', 'Q')}  Выход`)
     const choice = (await ask('\n  Выбор', 'Q')).toLowerCase()
 
@@ -762,6 +808,9 @@ async function menu(cfg) {
     } else if (choice === '8') {
       await runBenchCommand(cfg, [])
       await ask('\n  Enter — продолжить')
+    } else if (choice === '9') {
+      await showMetrics(cfg)
+      await ask('  Enter — продолжить')
     } else if (choice === 'q' || choice === '0') return
   }
 }
@@ -795,7 +844,8 @@ else if (cmd === 'restart') {
   if (!configured(cfg)) bad('Не настроено — запусти setup.bat')
   else if (!(await alive(cfg))) bad(`Не запущен (порт ${cfg.port})`)
   else await showStatus(cfg)
-} else if (cmd === 'test') await quickTest(cfg)
+} else if (cmd === 'stats') await showMetrics(cfg)
+else if (cmd === 'test') await quickTest(cfg)
 else if (cmd === 'logs') tailLog(Number(arg) || 25)
 else if (cmd === 'models') listModels()
 else if (cmd === 'bench') await runBenchCommand(cfg, process.argv.slice(3))
@@ -820,7 +870,7 @@ else if (!cmd) {
   await menu(cfg)
 } else {
   console.log(
-    'Использование: node src/cli.mjs [setup|start|stop|restart|status|test|logs|models|bench|opencode-install|opencode-remove|opencode-status|autostart-on|autostart-off]',
+    'Использование: node src/cli.mjs [setup|start|stop|restart|status|stats|test|logs|models|bench|opencode-install|opencode-remove|opencode-status|autostart-on|autostart-off]',
   )
 }
 

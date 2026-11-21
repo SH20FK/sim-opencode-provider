@@ -13,6 +13,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createRateLimiter } from './ratelimit.mjs'
+import { sanitizeModelText, hasBrFlood } from './sanitize.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
@@ -30,7 +31,7 @@ const DEFAULTS = {
   maxConcurrent: 0,
   requestTimeoutMs: 290000,
   fallbackModel: '',
-  cache: { enabled: true, ttlMs: 600000, maxEntries: 200 },
+  cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
   proxyTools: { now: true, web_fetch: true, web_search: true },
   nudge: { enabled: true, maxRetries: 2 },
   chunking: { enabled: true, maxParts: 24 },
@@ -101,6 +102,7 @@ const stats = {
   chunks: 0,
   chunkShrinks: 0,
   fallbacks: 0,
+  brFloods: 0,
   dedupedResults: 0,
   lastErrors: [],
   tokensIn: 0,
@@ -319,6 +321,11 @@ function activeProxyTools() {
 // ---------------------------------------------------------------- sim client
 const CONTINUE_MARK = '<<<CONTINUE>>>'
 
+// Some models answer in HTML when the task feels like a web page. OpenCode
+// renders markdown, so a <br> ends up as a wall of blank lines; say it plainly.
+const FORMAT_RULE =
+  'Formatting: answer in markdown with real line breaks. Never emit HTML tags such as <br>, <p> or <div>.'
+
 // Sim cuts a single tool call off after ~120 s, and answers that hit max_tokens
 // come back empty. So long answers are produced in parts and stitched together.
 const DEFAULT_CHUNK = { words: 250, lines: 100 }
@@ -533,7 +540,21 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
         throw err
       }
       const out = payload.output || {}
-      const answer = typeof out.content === 'string' ? out.content : ''
+      const rawAnswer = typeof out.content === 'string' ? out.content : ''
+      // Haiku-class models sometimes loop on <br>; turn that into newlines before
+      // anything else sees the text (streaming parts, JSON scan, the client).
+      if (hasBrFlood(rawAnswer)) {
+        stats.brFloods++
+        log(`<br> flood from ${model}: ${rawAnswer.length} chars, cleaning`)
+      }
+      const answer = sanitizeModelText(rawAnswer)
+      // Nothing but markup: ask again instead of handing the client an empty reply.
+      if (!answer && hasBrFlood(rawAnswer) && attempt < 2) {
+        stats.emptyRetries = (stats.emptyRetries || 0) + 1
+        lastErr = new Error('Sim returned only <br> markup')
+        log(`${model} answered with <br> tags only, retrying`)
+        continue
+      }
       // Sim answers with an empty body when a reply is cut off by maxTokens, so
       // ask again without the cap instead of handing the client an empty answer.
       if (!answer && limit && out.tokens && Number(out.tokens.output) >= limit) {
@@ -594,6 +615,7 @@ function toolSpecPrompt(tools) {
     '- If a result already reports success, do not repeat that call.',
     '- Only when no tool is needed, answer as plain text (never JSON).',
     '- Never use tool names outside this list.',
+    '- Write real line breaks; never emit HTML tags such as <br>, <p> or <div>.',
     '- No XML (<invoke>, <parameter>, antml:*), no markdown fences around the JSON.',
   ].join('\n')
 }
@@ -941,25 +963,186 @@ function buildTranscript(messages) {
 }
 
 // ------------------------------------------------------------------ cache
-const cache = new Map()
+// Answers are cached only for plain (non-tool) requests at temperature 0. The
+// cache lives in memory and is mirrored to disk so a restart does not lose it.
+const CACHE_FILE = path.join(ROOT, 'cache.json')
+const CACHE_MAX_BYTES = Number(cfg.cache.maxBytes) || 8 * 1024 * 1024
+
+const cache = new Map() // key -> { at, model, value, bytes }
+let cacheBytes = 0
+let cacheSaveTimer = null
 
 function cacheKey(parts) {
   return crypto.createHash('sha1').update(parts).digest('hex')
 }
 
-function cacheGet(key) {
+// A model can be told to keep its answers longer (or shorter) than the default.
+function cacheTtl(model) {
+  const byModel = cfg.cache.ttlByModel || {}
+  const ttl = Number(byModel[model])
+  return ttl > 0 ? ttl : cfg.cache.ttlMs
+}
+
+function cacheDrop(key) {
+  const hit = cache.get(key)
+  if (!hit) return false
+  cacheBytes -= hit.bytes
+  return cache.delete(key)
+}
+
+function cacheGet(key, model) {
   const hit = cache.get(key)
   if (!hit) return null
-  if (Date.now() - hit.at > cfg.cache.ttlMs) {
-    cache.delete(key)
+  if (Date.now() - hit.at > cacheTtl(hit.model || model)) {
+    cacheDrop(key)
     return null
   }
+  // LRU: re-insert so the newest entry is at the end of the Map.
+  cache.delete(key)
+  cache.set(key, hit)
   return hit.value
 }
 
-function cacheSet(key, value) {
-  if (cache.size >= cfg.cache.maxEntries) cache.delete(cache.keys().next().value)
-  cache.set(key, { at: Date.now(), value })
+function cacheSet(key, value, model) {
+  const bytes = Buffer.byteLength(value) + 64
+  if (bytes > CACHE_MAX_BYTES / 4) return // one answer must not own the file
+  cacheDrop(key)
+  const maxEntries = Math.max(1, Number(cfg.cache.maxEntries) || 200)
+  while (cache.size && (cache.size >= maxEntries || cacheBytes + bytes > CACHE_MAX_BYTES)) {
+    cacheDrop(cache.keys().next().value)
+  }
+  cache.set(key, { at: Date.now(), model, value, bytes })
+  cacheBytes += bytes
+  scheduleCacheSave()
+}
+
+function scheduleCacheSave() {
+  if (cacheSaveTimer) return
+  cacheSaveTimer = setTimeout(() => {
+    cacheSaveTimer = null
+    try {
+      const entries = {}
+      for (const [key, hit] of cache) entries[key] = { at: hit.at, model: hit.model, value: hit.value }
+      const tmp = `${CACHE_FILE}.tmp`
+      fs.writeFileSync(tmp, JSON.stringify({ version: 1, savedAt: Date.now(), entries }))
+      fs.renameSync(tmp, CACHE_FILE)
+    } catch (err) {
+      log(`cache save failed: ${err.message}`)
+    }
+  }, 2000)
+  cacheSaveTimer.unref?.()
+}
+
+function loadCache() {
+  if (!cfg.cache.enabled || cfg.cache.persist === false) return
+  let raw
+  try {
+    raw = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8').replace(/^\uFEFF/, ''))
+  } catch {
+    return
+  }
+  const entries = (raw && raw.entries) || {}
+  const now = Date.now()
+  const list = []
+  for (const [key, hit] of Object.entries(entries)) {
+    if (!hit || typeof hit.value !== 'string' || !hit.at) continue
+    if (now - hit.at > cacheTtl(hit.model)) continue
+    list.push([key, hit])
+  }
+  list.sort((a, b) => a[1].at - b[1].at)
+  for (const [key, hit] of list) cacheSet(key, hit.value, hit.model)
+  // cacheSet schedules a save; the loaded file is already current, so skip it.
+  if (cacheSaveTimer) clearTimeout(cacheSaveTimer)
+  cacheSaveTimer = null
+  const kept = cache.size
+  const dropped = Object.keys(entries).length - kept
+  log(`cache loaded: ${kept} entries${dropped > 0 ? `, ${dropped} expired/over limit` : ''}`)
+}
+
+function cacheInfo() {
+  return {
+    enabled: Boolean(cfg.cache.enabled),
+    persist: cfg.cache.persist !== false,
+    entries: cache.size,
+    bytes: cacheBytes,
+    maxEntries: cfg.cache.maxEntries,
+    maxBytes: CACHE_MAX_BYTES,
+    ttlMs: cfg.cache.ttlMs,
+    ttlByModel: cfg.cache.ttlByModel || {},
+  }
+}
+
+// -------------------------------------------------------- rolling metrics
+// Last N finished chat requests, kept so /stats can show an hour-long view:
+// per-model latency percentiles, 429/timeout share, answer size, cache hit rate.
+const RECENT_MAX = 500
+const recent = []
+
+function recordRequest(entry) {
+  recent.unshift({ ...entry, at: Date.now() })
+  if (recent.length > RECENT_MAX) recent.length = RECENT_MAX
+}
+
+function percentile(sorted, p) {
+  if (!sorted.length) return 0
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1))
+  return sorted[idx]
+}
+
+function windowMetrics(windowMs = 3600000) {
+  const since = Date.now() - windowMs
+  const rows = recent.filter((r) => r.at >= since)
+  const byModel = new Map()
+  let hits = 0
+  let lookups = 0
+  for (const r of rows) {
+    const m = byModel.get(r.model) || {
+      model: r.model, requests: 0, ok: 0, errors: 0, rateLimited: 0, timeouts: 0,
+      cacheHits: 0, cacheLookups: 0, latencies: [], outTokens: 0, outChars: 0,
+    }
+    m.requests++
+    if (r.outcome === 'ok' || r.outcome === 'truncated') m.ok++
+    else m.errors++
+    if (r.rateLimited) m.rateLimited++
+    if (r.outcome === 'timeout') m.timeouts++
+    if (r.cache === 'hit') {
+      m.cacheHits++
+      hits++
+    }
+    if (r.cache === 'hit' || r.cache === 'miss') {
+      m.cacheLookups++
+      lookups++
+    }
+    m.latencies.push(r.ms)
+    m.outTokens += r.outTokens || 0
+    m.outChars += r.outChars || 0
+    byModel.set(r.model, m)
+  }
+  const models = [...byModel.values()]
+    .map((m) => {
+      const sorted = m.latencies.sort((a, b) => a - b)
+      const pct = (n) => (m.requests ? Math.round((n / m.requests) * 1000) / 10 : 0)
+      return {
+        model: m.model,
+        requests: m.requests,
+        errors: m.errors,
+        rateLimitedPct: pct(m.rateLimited),
+        timeoutPct: pct(m.timeouts),
+        p50Ms: percentile(sorted, 50),
+        p95Ms: percentile(sorted, 95),
+        avgTokensOut: Math.round(m.outTokens / m.requests),
+        avgChars: Math.round(m.outChars / m.requests),
+        cacheHitRate: m.cacheLookups ? Math.round((m.cacheHits / m.cacheLookups) * 1000) / 10 : null,
+      }
+    })
+    .sort((a, b) => b.requests - a.requests)
+  return {
+    windowMs,
+    since: new Date(since).toISOString(),
+    requests: rows.length,
+    cacheHitRate: lookups ? Math.round((hits / lookups) * 1000) / 10 : null,
+    models,
+  }
 }
 
 // --------------------------------------------------------------- http utils
@@ -1028,7 +1211,11 @@ async function handleChat(req, res) {
 
   const { system, context: transcript } = buildTranscript(messages)
   const toolBlock = emulation ? toolSpecPrompt(tools) : ''
-  const systemPrompt = [system, emulation ? 'Tool calling protocol is defined at the very end of the transcript. Follow it exactly.' : '']
+  const systemPrompt = [
+    system,
+    FORMAT_RULE,
+    emulation ? 'Tool calling protocol is defined at the very end of the transcript. Follow it exactly.' : '',
+  ]
     .filter(Boolean)
     .join('\n\n')
 
@@ -1139,12 +1326,15 @@ async function handleChat(req, res) {
     streamed.chars += text.length
   }
 
+  let cacheState = 'off'
   try {
     if (ckey) {
-      const hit = cacheGet(ckey)
+      cacheState = 'miss'
+      const hit = cacheGet(ckey, requestedModel)
       if (hit) {
         stats.cacheHits++
         usedCache = true
+        cacheState = 'hit'
         content = hit
       }
     }
@@ -1267,6 +1457,15 @@ async function handleChat(req, res) {
     cleanup()
     stats.errors++
     if (err && err.code === 'TIMEOUT') stats.timeouts = (stats.timeouts || 0) + 1
+    recordRequest({
+      model,
+      ms: Date.now() - startedAll,
+      outcome: err && err.code === 'TIMEOUT' ? 'timeout' : 'error',
+      rateLimited: Boolean(err && err.status === 429),
+      cache: cacheState,
+      outTokens: (tokens && tokens.output) || 0,
+      outChars: (content && content.length) || 0,
+    })
     let msg = String((err && err.message) || err)
     if (err && err.code === 'TIMEOUT') {
       msg =
@@ -1332,7 +1531,17 @@ async function handleChat(req, res) {
       ` · ${usage.total_tokens} tok`,
   )
 
-  if (ckey && !usedCache && content) cacheSet(ckey, content)
+  if (ckey && !usedCache && content) cacheSet(ckey, content, requestedModel)
+
+  recordRequest({
+    model,
+    ms,
+    outcome: truncated ? 'truncated' : 'ok',
+    rateLimited: false,
+    cache: cacheState,
+    outTokens: usage.completion_tokens,
+    outChars: (content && content.length) || 0,
+  })
 
   traceRequest({
     id: rid, at: new Date().toISOString(), model, inChars, tools: tools.length,
@@ -1444,11 +1653,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && p === '/stats') {
+    const windowSec = Math.min(24 * 3600, Math.max(60, Number(url.searchParams.get('window')) || 3600))
     return json(res, 200, {
       ...stats,
       chunkSizes: Object.fromEntries(chunkSizes),
       credits: creditsCache.data || null,
       rateLimit: limiter.state(),
+      cacheInfo: cacheInfo(),
+      window: windowMetrics(windowSec * 1000),
       inflight: [...inflight.entries()].map(([id, v]) => ({
         id,
         model: v.model,
@@ -1456,6 +1668,11 @@ const server = http.createServer(async (req, res) => {
         elapsedMs: Date.now() - v.startedAt,
       })),
     })
+  }
+
+  if (req.method === 'GET' && p === '/metrics') {
+    const windowSec = Math.min(24 * 3600, Math.max(60, Number(url.searchParams.get('window')) || 3600))
+    return json(res, 200, windowMetrics(windowSec * 1000))
   }
 
   if (req.method === 'GET' && p === '/credits') {
@@ -1486,6 +1703,7 @@ const server = http.createServer(async (req, res) => {
 
 readModelsCache()
 loadChunkSizes()
+loadCache()
 await refreshModels()
 
 server.on('error', (err) => {

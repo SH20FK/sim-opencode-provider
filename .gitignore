@@ -1,6 +1,7 @@
 # local state
 config.json
 models.cache.json
+cache.json
 chunk.state.json
 bench.json
 *.log

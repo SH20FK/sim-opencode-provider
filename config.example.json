@@ -10,8 +10,11 @@
   "fallbackModel": "gpt-5.3-codex",
   "cache": {
     "enabled": true,
+    "persist": true,
     "ttlMs": 600000,
-    "maxEntries": 200
+    "maxEntries": 200,
+    "maxBytes": 8388608,
+    "ttlByModel": {}
   },
   "proxyTools": {
     "now": true,
