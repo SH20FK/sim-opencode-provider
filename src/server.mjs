@@ -113,6 +113,7 @@ const stats = {
   chunkShrinks: 0,
   fallbacks: 0,
   upstreamRetries: 0,
+  unparsedCalls: 0,
   brFloods: 0,
   dedupedResults: 0,
   lastErrors: [],
@@ -1289,6 +1290,10 @@ async function handleChat(req, res) {
           if (calls) {
             calls = repairCalls(calls, tools)
             content = stripToolArtifacts(content)
+          } else if (/"tool_calls"\s*:/.test(content)) {
+            // Useful when a model invents a JSON shape the parser cannot read.
+            stats.unparsedCalls = (stats.unparsedCalls || 0) + 1
+            log(`unparsed tool call from ${model}: ${content.length} chars, head=${short(content.replace(/\s+/g, ' '), 140)}`)
           }
         }
 

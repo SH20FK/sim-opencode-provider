@@ -1,6 +1,59 @@
 // Tool-call spellings that hosted models produce without native support, and
 // the cleanup that keeps those spellings out of the visible answer.
 
+// Models often write raw newlines and tabs inside JSON strings, which is
+// invalid JSON. Escape them (and drop trailing commas) before giving up.
+function parseLoose(candidate) {
+  try {
+    return JSON.parse(candidate)
+  } catch {}
+  let out = ''
+  let inStr = false
+  let esc = false
+  for (const ch of candidate) {
+    if (inStr) {
+      if (esc) {
+        out += ch
+        esc = false
+        continue
+      }
+      if (ch === '\\') {
+        out += ch
+        esc = true
+        continue
+      }
+      if (ch === '"') {
+        out += ch
+        inStr = false
+        continue
+      }
+      if (ch === '\n') {
+        out += '\\n'
+        continue
+      }
+      if (ch === '\r') {
+        out += '\\r'
+        continue
+      }
+      if (ch === '\t') {
+        out += '\\t'
+        continue
+      }
+      out += ch
+      continue
+    }
+    if (ch === '"') inStr = true
+    out += ch
+  }
+  try {
+    return JSON.parse(out)
+  } catch {}
+  try {
+    return JSON.parse(out.replace(/,\s*([}\]])/g, '$1'))
+  } catch {}
+  return null
+}
+
 // Pull every balanced {...} object out of the text, fences first.
 export function jsonCandidates(text) {
   const out = []
@@ -132,9 +185,8 @@ export function stripToolArtifacts(text) {
   let s = text
   if (/tool_calls|toolCalls|"arguments"/.test(s)) {
     for (const candidate of jsonCandidates(s)) {
-      try {
-        if (normalizeCalls(JSON.parse(candidate), null)) s = s.split(candidate).join('')
-      } catch {}
+      const parsed = parseLoose(candidate)
+      if (parsed !== null && normalizeCalls(parsed, null)) s = s.split(candidate).join('')
     }
   }
   s = s.replace(/```[a-zA-Z]*\s*```/g, '')
@@ -157,15 +209,11 @@ export function stripToolArtifacts(text) {
 // The two extractors used by the proxy. Kept here so they can be tested
 // without starting a server.
 export function extractJsonCalls(text, tools) {
-  if (!tools || !tools.length || text.length > 40000) return null
+  if (!tools || !tools.length || text.length > 200000) return null
   const allowed = new Set(tools.map((t) => (t.function || t).name))
   for (const candidate of jsonCandidates(text)) {
-    let parsed
-    try {
-      parsed = JSON.parse(candidate)
-    } catch {
-      continue
-    }
+    const parsed = parseLoose(candidate)
+    if (parsed === null) continue
     const calls = normalizeCalls(parsed, allowed)
     if (calls) return calls
   }

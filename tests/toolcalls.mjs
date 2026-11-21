@@ -15,6 +15,7 @@ const tools = [
   { function: { name: 'shell', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
   { function: { name: 'webfetch', parameters: { type: 'object', properties: { url: { type: 'string' } } } } },
   { function: { name: 'websearch', parameters: { type: 'object', properties: { query: { type: 'string' } } } } },
+  { function: { name: 'edit', parameters: { type: 'object', properties: { path: { type: 'string' } } } } },
 ]
 
 // The exact mess from a haiku answer: prose, JSON call, XML call, _call pair.
@@ -82,6 +83,18 @@ check(
   !/invoke:|<parameter|<\/invoke>/i.test(bareOut) && bareOut.includes('Ищу ещё раз'),
   JSON.stringify(bareOut),
 )
+
+// Invalid JSON with raw newlines inside strings: models do this and it used to
+// fall through as visible text.
+const broken = '{"tool_calls":[{"name":"edit","arguments":{"path":"a.dart","oldString":"line1\nline2","newString":"x"}}]}'
+const brokenCalls = extractJsonCalls(broken, tools)
+check('raw newlines in json repaired', brokenCalls && brokenCalls[0].name === 'edit', JSON.stringify(brokenCalls))
+check('broken json stripped', !stripToolArtifacts(broken).includes('tool_calls'), JSON.stringify(stripToolArtifacts(broken).slice(0, 80)))
+
+// Trailing comma before a brace.
+const comma = '{"tool_calls":[{"name":"shell","arguments":{"command":"dir",},}],}'
+const commaCalls = extractJsonCalls(comma, tools)
+check('trailing commas repaired', commaCalls && commaCalls[0].name === 'shell', JSON.stringify(commaCalls))
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed')
 process.exit(failures ? 1 : 0)
