@@ -32,6 +32,7 @@ const DEFAULTS = {
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200 },
   proxyTools: { now: true, web_fetch: true, web_search: true },
   nudge: { enabled: true, maxRetries: 2 },
+  chunking: { enabled: true, maxParts: 12 },
   maxProxyToolHops: 3,
 }
 
@@ -55,6 +56,7 @@ function loadConfig() {
     cache: { ...DEFAULTS.cache, ...(raw.cache || {}) },
     proxyTools: { ...DEFAULTS.proxyTools, ...(raw.proxyTools || {}) },
     nudge: { ...DEFAULTS.nudge, ...(raw.nudge || {}) },
+    chunking: { ...DEFAULTS.chunking, ...(raw.chunking || {}) },
   }
 }
 
@@ -272,6 +274,72 @@ function activeProxyTools() {
 }
 
 // ---------------------------------------------------------------- sim client
+const CONTINUE_MARK = '<<<CONTINUE>>>'
+
+// Sim cuts a single tool call off after ~120 s, and answers that hit max_tokens
+// come back empty. So long answers are produced in parts and stitched together.
+function chunkingInstruction() {
+  return (
+    'Long-answer rule: when your reply would run longer than about 250 words, or you are about to write a file ' +
+    'longer than about 100 lines, do not write it all at once. Write the first part only and end that message ' +
+    `with a line containing exactly ${CONTINUE_MARK}. A tool call that would carry a very large file is split ` +
+    'into several smaller calls instead: write the first half, then append the rest with edit/patch calls. ' +
+    'Otherwise answer normally and never mention this rule.'
+  )
+}
+
+async function simChatChunked({ model, systemPrompt, context, temperature, maxTokens, signal }) {
+  if (!cfg.chunking.enabled) return simChat({ model, systemPrompt, context, temperature, maxTokens, signal })
+
+  // A large client-side cap would only make Sim return an empty body when hit.
+  const limit = typeof maxTokens === 'number' && maxTokens > 0 && maxTokens <= 2000 ? maxTokens : undefined
+  const parts = []
+  const tokens = { input: 0, output: 0, total: 0 }
+  let ctx = context
+  let cost = null
+  let hint = ''
+
+  for (let i = 0; i < (cfg.chunking.maxParts || 12); i++) {
+    const system = [systemPrompt, chunkingInstruction(), hint].filter(Boolean).join('\n\n')
+    let res
+    try {
+      res = await simChat({ model, systemPrompt: system, context: ctx, temperature, maxTokens: limit, signal })
+    } catch (err) {
+      // A part that is still too long gets one retry with a much smaller budget.
+      if (err.code === 'TIMEOUT' && !hint) {
+        stats.chunkShrinks = (stats.chunkShrinks || 0) + 1
+        log(`chunk ${i + 1} of ${model} timed out, retrying with a smaller part`)
+        hint =
+          `The previous attempt was cut off for being too long. This time write a much shorter part: ` +
+          `at most 100 words (or 40 lines of code), and end it with ${CONTINUE_MARK}.`
+        i--
+        continue
+      }
+      throw err
+    }
+    if (res.tokens) {
+      tokens.input += res.tokens.input || 0
+      tokens.output += res.tokens.output || 0
+      tokens.total += res.tokens.total || 0
+    }
+    if (res.cost) cost = res.cost
+    let text = res.content || ''
+    if (text.includes(CONTINUE_MARK)) {
+      text = text.split(CONTINUE_MARK).join('')
+      parts.push(text)
+      stats.chunks = (stats.chunks || 0) + 1
+      ctx =
+        `${context}\n\n[assistant]\n${parts.join('')}\n\n[user]\n` +
+        `Continue exactly where you stopped. Do not repeat anything and do not add commentary. ` +
+        `If more remains, end with ${CONTINUE_MARK} on its own line.`
+      continue
+    }
+    parts.push(text)
+    return { content: parts.join(''), tokens, cost, chunks: parts.length }
+  }
+  return { content: parts.join(''), tokens, cost, chunks: parts.length }
+}
+
 async function simChat({ model, systemPrompt, context, temperature, maxTokens, signal }) {
   const input = { model, context }
   if (systemPrompt) input.systemPrompt = systemPrompt
@@ -316,7 +384,12 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
           (payload.output && payload.output.data && payload.output.data.error) ||
           (payload.error && payload.error.message) ||
           'tool failed'
-        throw new Error(`Sim model error: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`)
+        const text = typeof msg === 'string' ? msg : JSON.stringify(msg)
+        const err = new Error(`Sim model error: ${text}`)
+        // Sim cuts a model call off after ~120 s and reports it as a failed run.
+        err.code = /timed?\s?out|timeout/i.test(text) ? 'TIMEOUT' : 'SIM_FAILED'
+        err.status = err.code === 'TIMEOUT' ? 504 : 502
+        throw err
       }
       const out = payload.output || {}
       return {
@@ -746,12 +819,19 @@ async function handleChat(req, res) {
         hops = hop
         let result
         try {
-          result = await simChat({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
+          result = await simChatChunked({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
         } catch (err) {
           const status = err.status
-          if (cfg.fallbackModel && cfg.fallbackModel !== model && (status === 402 || status === 404 || status === 429 || status >= 500)) {
+          const retryable =
+            status === 402 || status === 404 || status === 429 || status >= 500 || err.code === 'TIMEOUT'
+          if (cfg.fallbackModel && cfg.fallbackModel !== model && retryable) {
             log(`fallback ${model} -> ${cfg.fallbackModel} (${short(err.message, 120)})`)
             model = cfg.fallbackModel
+            result = await simChat({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
+          } else if (err.code === 'TIMEOUT' && hop === 0 && !cfg.fallbackModel) {
+            // A timeout is often a one-off stall: try the same model once more before giving up.
+            stats.timeouts = (stats.timeouts || 0) + 1
+            log(`timeout ${model}, retrying once`)
             result = await simChat({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
           } else {
             throw err
@@ -842,16 +922,25 @@ async function handleChat(req, res) {
   } catch (err) {
     cleanup()
     stats.errors++
-    const msg = String((err && err.message) || err)
+    if (err && err.code === 'TIMEOUT') stats.timeouts = (stats.timeouts || 0) + 1
+    let msg = String((err && err.message) || err)
+    if (err && err.code === 'TIMEOUT') {
+      msg =
+        `Sim stopped the call to ${model} after ~120 s (its per-call limit). ` +
+        'The model was still generating a long answer. Ask for a smaller chunk, or switch to a faster model.'
+    }
     stats.errorsByCode = stats.errorsByCode || {}
     log(`chat ${model} FAILED in ${Date.now() - startedAll}ms: ${short(msg, 240)}`)
-    const status = /no longer available|not found|unknown model/i.test(msg)
-      ? 404
-      : /api key is required|unauthorized/i.test(msg)
-        ? 401
-        : /402|credit|limit/i.test(msg)
-          ? 402
-          : 502
+    const status =
+      err && err.code === 'TIMEOUT'
+        ? 504
+        : /no longer available|not found|unknown model/i.test(msg)
+          ? 404
+          : /api key is required|unauthorized/i.test(msg)
+            ? 401
+            : /402|credit/i.test(msg)
+              ? 402
+              : 502
     if (res.headersSent) {
       sendSse(res, { error: { message: msg, type: 'upstream_error' } })
       res.write('data: [DONE]\n\n')

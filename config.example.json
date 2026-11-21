@@ -7,7 +7,7 @@
   "toolTemperature": 0,
   "maxConcurrent": 2,
   "requestTimeoutMs": 290000,
-  "fallbackModel": "claude-sonnet-5-5",
+  "fallbackModel": "gpt-5.3-codex",
   "cache": {
     "enabled": true,
     "ttlMs": 600000,
@@ -22,5 +22,9 @@
     "enabled": true,
     "maxRetries": 2
   },
-  "maxProxyToolHops": 3
+  "maxProxyToolHops": 3,
+  "chunking": {
+    "enabled": true,
+    "maxParts": 12
+  }
 }
