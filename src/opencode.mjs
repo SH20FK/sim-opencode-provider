@@ -4,6 +4,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { limitsFor } from './limits.mjs'
 
 export const PROVIDER_ID = 'sim'
 
@@ -61,10 +62,11 @@ export function buildProvider(baseURL, ids, apiKey) {
   const list = ids && ids.length ? ids : MODELS.map((m) => m.id)
   const models = {}
   for (const id of list) {
-    const meta = known.get(id) || { name: `${id} (Sim)`, context: 200000, output: 32000 }
+    const meta = known.get(id)
+    const lim = limitsFor(id, meta)
     models[id] = {
-      name: meta.name,
-      limit: { context: meta.context, output: meta.output },
+      name: (meta && meta.name) || `${id} (Sim)`,
+      limit: { context: lim.context, output: lim.output },
       cost: { input: 0, output: 0 },
     }
   }

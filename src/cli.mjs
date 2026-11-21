@@ -2,7 +2,7 @@
 //
 //   node src/cli.mjs                 panel (wizard on first run)
 //   node src/cli.mjs setup           configure API key / workspace
-//   node src/cli.mjs start|stop|restart|status|stats|test|logs|models
+//   node src/cli.mjs start|stop|restart|status|stats|test|logs|models|limits
 //   node src/cli.mjs opencode-install|opencode-remove|opencode-status
 //   node src/cli.mjs autostart-on|autostart-off
 
@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import readline from 'node:readline'
 import { stdin as input, stdout as output } from 'node:process'
 import * as opencode from './opencode.mjs'
+import { refreshLimits, loadLimits } from './limits.mjs'
 import { runBench, writeTable, defaultDesktopPath } from './bench.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -667,9 +668,36 @@ async function installProvider(cfg) {
     saveConfig(cfg)
     info('  локальный токен создан и сохранён в config.json')
   }
+  // Limits decide when OpenCode compacts history; refresh when the network allows.
+  try {
+    const r = await refreshLimits(cfg, opencode.MODELS.map((m) => m.id))
+    info(`  лимиты моделей: ${r.found}/${r.total} из models.dev`)
+  } catch (err) {
+    warn(`  лимиты моделей: models.dev недоступен (${err.message}) — беру сохранённые`)
+  }
   const hosted = await opencode.fetchHosted(cfg)
   const res = opencode.install(baseURL(cfg), { hosted, apiKey: cfg.localToken })
   return { ...res, hosted: Boolean(hosted) }
+}
+
+async function refreshLimitsCommand(cfg) {
+  try {
+    const r = await refreshLimits(cfg, opencode.MODELS.map((m) => m.id))
+    ok(`лимиты обновлены: ${r.found}/${r.total} моделей`)
+    if (r.missing.length) {
+      const head = r.missing.slice(0, 5).join(', ')
+      const more = r.missing.length > 5 ? ` и ещё ${r.missing.length - 5}` : ''
+      info(`  без данных models.dev: ${head}${more}`)
+    }
+    const sample = ['claude-haiku-5-5', 'claude-fable-5-2', 'gpt-5.4-mini'].filter((id) => loadLimits()[id])
+    for (const id of sample) {
+      const l = loadLimits()[id]
+      info(`  ${id}: ${l.context} контекст / ${l.output} выход`)
+    }
+    info('  применится к OpenCode после «opencode-install» (или пункт «Ещё → OpenCode»)')
+  } catch (err) {
+    bad(`не смог обновить: ${err.message}`)
+  }
 }
 
 async function opencodeMenu(cfg) {
@@ -944,6 +972,7 @@ else if (cmd === 'restart') {
 else if (cmd === 'test') await quickTest(cfg)
 else if (cmd === 'logs') tailLog(Number(arg) || 25)
 else if (cmd === 'models') listModels()
+else if (cmd === 'limits') await refreshLimitsCommand(cfg)
 else if (cmd === 'bench') await runBenchCommand(cfg, process.argv.slice(3))
 else if (cmd === 'opencode-install') {
   const r = await installProvider(cfg)
@@ -966,7 +995,7 @@ else if (!cmd) {
   await menu(cfg)
 } else {
   console.log(
-    'Использование: node src/cli.mjs [setup|start|stop|restart|status|stats|test|logs|models|bench|opencode-install|opencode-remove|opencode-status|autostart-on|autostart-off]',
+    'Использование: node src/cli.mjs [setup|start|stop|restart|status|stats|test|logs|models|limits|bench|opencode-install|opencode-remove|opencode-status|autostart-on|autostart-off]',
   )
 }
 

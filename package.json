@@ -16,6 +16,6 @@
     "opencode:install": "node src/cli.mjs opencode-install",
     "test:smoke": "node tests/smoke.mjs",
     "test:unit": "node tests/sanitize.mjs",
-    "check": "node --check src/server.mjs && node --check src/cli.mjs && node --check src/opencode.mjs && node --check src/sanitize.mjs"
+    "check": "node --check src/server.mjs && node --check src/cli.mjs && node --check src/opencode.mjs && node --check src/sanitize.mjs && node --check src/limits.mjs"
   }
 }
