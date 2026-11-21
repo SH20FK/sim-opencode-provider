@@ -122,6 +122,10 @@ function traceRequest(entry) {
   if (traces.length > 20) traces.length = 20
 }
 
+// Requests currently waiting on Sim, so /stats and the panel can show what is
+// happening right now instead of only what already finished.
+const inflight = new Map()
+
 function bump(model, ms, tokensIn, tokensOut) {
   const m = (stats.byModel[model] = stats.byModel[model] || { calls: 0, tokensIn: 0, tokensOut: 0, latencyMs: 0 })
   m.calls++
@@ -521,7 +525,7 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
         // catalogue but cannot be reached, so it must not be swapped silently.
         const timedOut = /timed?\s?out|timeout/i.test(text)
         const unavailable =
-          /is not available|no longer available|unknown model|api key is required|unsupported model|evaluation or chat modality|modality/i.test(
+          /is not available|no longer available|unknown model|api key is required|unsupported model|evaluation or chat modality|modality|does not exist|do not have access|api error \(404\)/i.test(
             text,
           )
         err.code = timedOut ? 'TIMEOUT' : unavailable ? 'UNAVAILABLE' : 'SIM_FAILED'
@@ -1038,6 +1042,8 @@ async function handleChat(req, res) {
 
   const rid = `sim-${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-4)}`
   res.setHeader('X-Request-Id', rid)
+  inflight.set(rid, { model: requestedModel, tools: `${clientTools.length}+${proxyTools.length}`, startedAt: Date.now() })
+  res.once('close', () => inflight.delete(rid))
   // Where the input tokens actually go: system prompt, our tool block, history.
   const inChars = {
     system: system.length,
@@ -1443,6 +1449,12 @@ const server = http.createServer(async (req, res) => {
       chunkSizes: Object.fromEntries(chunkSizes),
       credits: creditsCache.data || null,
       rateLimit: limiter.state(),
+      inflight: [...inflight.entries()].map(([id, v]) => ({
+        id,
+        model: v.model,
+        tools: v.tools,
+        elapsedMs: Date.now() - v.startedAt,
+      })),
     })
   }
 

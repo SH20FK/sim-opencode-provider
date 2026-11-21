@@ -415,6 +415,14 @@ async function showStatus(cfg) {
   } else {
     info('  Sim: остаток кредитов недоступен')
   }
+  if (st.rateLimit && st.rateLimit.waitMs > 0) {
+    info(`  лимит Sim: ждём окно ещё ${Math.ceil(st.rateLimit.waitMs / 1000)} с`)
+  }
+  if (Array.isArray(st.inflight) && st.inflight.length) {
+    for (const r of st.inflight.slice(0, 4)) {
+      info(`  в работе: ${r.model} · ${Math.round(r.elapsedMs / 1000)} с · тулы ${r.tools}`)
+    }
+  }
   const top = Object.entries(st.byModel || {})
     .sort((a, b) => b[1].calls - a[1].calls)
     .slice(0, 4)
