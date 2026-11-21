@@ -112,6 +112,7 @@ const stats = {
   chunks: 0,
   chunkShrinks: 0,
   fallbacks: 0,
+  upstreamRetries: 0,
   brFloods: 0,
   dedupedResults: 0,
   lastErrors: [],
@@ -503,11 +504,29 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
       }
       const payload = data.data || {}
       if (payload.status === 'failed') {
-        const msg =
+        const rawMsg =
           (payload.output && payload.output.data && payload.output.data.error) ||
           (payload.error && payload.error.message) ||
           'tool failed'
-        const text = typeof msg === 'string' ? msg : JSON.stringify(msg)
+        // Sim often wraps the provider error in JSON; unwrap so the user sees a
+        // sentence, not a blob of JSON.
+        let text = typeof rawMsg === 'string' ? rawMsg : JSON.stringify(rawMsg)
+        try {
+          const parsed = JSON.parse(text)
+          text = (parsed.error && parsed.error.message) || parsed.message || text
+        } catch {}
+        text = String(text)
+        // Upstream 500s ("Internal server error", overloaded) are transient: one
+        // or two retries usually get through, and failing the whole turn is worse.
+        const transient = /internal server error|overloaded|service unavailable|temporarily|try again/i.test(text)
+        if (transient && attempt < 2) {
+          stats.upstreamRetries = (stats.upstreamRetries || 0) + 1
+          lastErr = new Error(`Sim model error: ${text}`)
+          const wait = backoffMs(attempt)
+          log(`Sim model error (${short(text, 90)}), retrying in ${wait}ms`)
+          await sleep(wait)
+          continue
+        }
         const err = new Error(`Sim model error: ${text}`)
         // Sim cuts a model call off at its timeout and reports it as a failed run.
         // "Provider X is not available" is permanent: the model exists in the
