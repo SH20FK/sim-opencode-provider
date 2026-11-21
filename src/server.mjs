@@ -499,8 +499,12 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
         const text = typeof msg === 'string' ? msg : JSON.stringify(msg)
         const err = new Error(`Sim model error: ${text}`)
         // Sim cuts a model call off after ~120 s and reports it as a failed run.
-        err.code = /timed?\s?out|timeout/i.test(text) ? 'TIMEOUT' : 'SIM_FAILED'
-        err.status = err.code === 'TIMEOUT' ? 504 : 502
+        // "Provider X is not available" is permanent: the model exists in the
+        // catalogue but cannot be reached, so it must not be swapped silently.
+        const timedOut = /timed?\s?out|timeout/i.test(text)
+        const unavailable = /is not available|no longer available|unknown model|api key is required|unsupported model/i.test(text)
+        err.code = timedOut ? 'TIMEOUT' : unavailable ? 'UNAVAILABLE' : 'SIM_FAILED'
+        err.status = timedOut ? 504 : unavailable ? 404 : 502
         throw err
       }
       const out = payload.output || {}
@@ -1126,8 +1130,10 @@ async function handleChat(req, res) {
           result = await simChatChunked({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal, onPart })
         } catch (err) {
           const status = err.status
+          // A permanently unavailable model is not a reason to answer as another one.
           const retryable =
-            status === 402 || status === 404 || status === 429 || status >= 500 || err.code === 'TIMEOUT'
+            err.code !== 'UNAVAILABLE' &&
+            (status === 402 || status === 404 || status === 429 || status >= 500 || err.code === 'TIMEOUT')
           if (cfg.fallbackModel && cfg.fallbackModel !== model && retryable) {
             stats.fallbacks++
             usedFallback = cfg.fallbackModel
@@ -1237,19 +1243,24 @@ async function handleChat(req, res) {
         `Sim stopped the call to ${model} after ~120 s (its per-call limit). ` +
         'The model was still generating a long answer. Ask for a smaller chunk, or switch to a faster model.'
     }
+    if (err && err.code === 'UNAVAILABLE') {
+      msg = `${model} is not available on Sim right now (${msg.replace(/^Sim model error:\s*/, '')}). Pick another model.`
+    }
     stats.errorsByCode = stats.errorsByCode || {}
     log(`chat ${model} FAILED in ${Date.now() - startedAll}ms: ${short(msg, 240)}`)
     rememberError(msg)
     const status =
       err && err.code === 'TIMEOUT'
         ? 504
-        : /no longer available|not found|unknown model/i.test(msg)
+        : err && err.code === 'UNAVAILABLE'
           ? 404
-          : /api key is required|unauthorized/i.test(msg)
-            ? 401
-            : /402|credit/i.test(msg)
-              ? 402
-              : 502
+          : /no longer available|not found|unknown model/i.test(msg)
+            ? 404
+            : /api key is required|unauthorized/i.test(msg)
+              ? 401
+              : /402|credit/i.test(msg)
+                ? 402
+                : 502
     if (body.stream && res.headersSent) {
       sendSse(res, { error: { message: msg, type: 'upstream_error' } })
       res.write('data: [DONE]\n\n')

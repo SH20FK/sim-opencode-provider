@@ -168,7 +168,7 @@ export async function runBench(options, onProgress = () => {}) {
 }
 
 function verdict(row) {
-  if (row.error) return 'ошибка'
+  if (row.error) return /is not available|api key is required/i.test(row.error) ? 'недоступна у Sim' : 'ошибка'
   const toolOk = row.tool && row.tool.name === 'read' && row.tool.argsOk
   const jsonOk = row.json && row.json.ok
   const tps = (row.speed && row.speed.tokPerSec) || 0
