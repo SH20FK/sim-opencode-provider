@@ -57,12 +57,15 @@ function backup(file) {
   return target
 }
 
-export function buildProvider(baseURL) {
+export function buildProvider(baseURL, ids) {
+  const known = new Map(MODELS.map((m) => [m.id, m]))
+  const list = ids && ids.length ? ids : MODELS.map((m) => m.id)
   const models = {}
-  for (const m of MODELS) {
-    models[m.id] = {
-      name: m.name,
-      limit: { context: m.context, output: m.output },
+  for (const id of list) {
+    const meta = known.get(id) || { name: `${id} (Sim)`, context: 200000, output: 32000 }
+    models[id] = {
+      name: meta.name,
+      limit: { context: meta.context, output: meta.output },
       cost: { input: 0, output: 0 },
     }
   }
@@ -71,6 +74,24 @@ export function buildProvider(baseURL) {
     name: 'Sim (free)',
     options: { baseURL, apiKey: 'sim-local' },
     models,
+  }
+}
+
+// All hosted models (no BYOK needed) straight from Sim's catalogue.
+export async function fetchHosted({ simApiKey, workspaceId }) {
+  try {
+    const res = await fetch(
+      `https://www.sim.ai/api/v2/blocks/agent?workspaceId=${encodeURIComponent(workspaceId)}`,
+      { headers: { 'X-API-Key': simApiKey }, signal: AbortSignal.timeout(15000) },
+    )
+    if (!res.ok) return null
+    const body = await res.json()
+    const field = ((body.data && body.data.inputSchema) || []).find((f) => f && f.id === 'model' && Array.isArray(f.options))
+    if (!field) return null
+    const hosted = field.options.filter((o) => o.hosted).map((o) => o.id)
+    return hosted.length ? hosted : null
+  } catch {
+    return null
   }
 }
 
@@ -91,16 +112,16 @@ export function inspect(file = configPath()) {
   return result
 }
 
-export function install(baseURL, file = configPath()) {
+export function install(baseURL, opts = {}, file = configPath()) {
   if (!fs.existsSync(file)) {
     throw new Error(`opencode.json не найден: ${file}\nЗапусти OpenCode хотя бы раз, чтобы он создал конфиг.`)
   }
   const cfg = readConfig(file)
   const saved = backup(file)
   cfg.provider = cfg.provider || {}
-  cfg.provider[PROVIDER_ID] = buildProvider(baseURL)
+  cfg.provider[PROVIDER_ID] = buildProvider(baseURL, opts.hosted)
   fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n')
-  return { path: file, backup: saved, models: MODELS.length }
+  return { path: file, backup: saved, models: Object.keys(cfg.provider[PROVIDER_ID].models).length }
 }
 
 export function remove(file = configPath()) {

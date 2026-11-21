@@ -455,6 +455,12 @@ ${paint('gray', `     "sim": {
 `)
 }
 
+async function installProvider(cfg) {
+  const hosted = await opencode.fetchHosted(cfg)
+  const res = opencode.install(baseURL(cfg), { hosted })
+  return { ...res, hosted: Boolean(hosted) }
+}
+
 async function opencodeMenu(cfg) {
   for (;;) {
     const st = opencode.inspect()
@@ -483,8 +489,8 @@ async function opencodeMenu(cfg) {
         continue
       }
       try {
-        const r = opencode.install(baseURL(cfg))
-        ok(`Провайдер установлен: ${r.models} моделей`)
+        const r = await installProvider(cfg)
+        ok(`Провайдер установлен: ${r.models} моделей${r.hosted ? ' (весь hosted-каталог)' : ' (каталог недоступен, базовый набор)'}`)
         info(`  бэкап: ${path.basename(r.backup)}`)
         console.log(paint('gray', '\n  Перезапусти OpenCode, затем /models → Sim (free)'))
       } catch (err) {
@@ -513,8 +519,8 @@ async function installProviderQuietly(cfg) {
     return
   }
   try {
-    const r = opencode.install(baseURL(cfg))
-    ok(`Провайдер добавлен в OpenCode (${r.models} моделей)`)
+    const r = await installProvider(cfg)
+    ok(`Провайдер добавлен в OpenCode (${r.models} моделей${r.hosted ? '' : ', каталог недоступен'})`)
     info(`  бэкап: ${path.basename(r.backup)}`)
   } catch (err) {
     bad(`OpenCode: ${err.message}`)
@@ -626,9 +632,10 @@ else if (cmd === 'restart') {
 else if (cmd === 'logs') tailLog(Number(arg) || 25)
 else if (cmd === 'models') listModels()
 else if (cmd === 'opencode-install') {
-  const r = opencode.install(baseURL(cfg))
+  const r = await installProvider(cfg)
   ok(`Провайдер установлен: ${r.models} моделей → ${r.path}`)
   info(`  бэкап: ${r.backup}`)
+  if (!r.hosted) warn('  каталог Sim недоступен — поставлен базовый набор из 29 моделей')
 } else if (cmd === 'opencode-remove') {
   const r = opencode.remove()
   r.removed ? ok(`Провайдер удалён (бэкап: ${r.backup})`) : warn('Провайдер не был установлен')
