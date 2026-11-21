@@ -775,15 +775,13 @@ async function settingsMenu(cfg) {
     console.log(`  1  Порт                       ${paint('cyan', cfg.port)}`)
     console.log(`  2  Эмуляция тулов             ${paint('cyan', cfg.toolEmulation ? 'вкл' : 'выкл')}`)
     console.log(`  3  Кеш ответов                ${paint('cyan', cfg.cache.enabled ? 'вкл' : 'выкл')}`)
-    console.log(`  4  Fallback-модель            ${paint('cyan', cfg.fallbackModel || '—')}`)
-    console.log(`  5  Свои тулы                   ${paint('cyan', ['now', 'web_fetch'].filter((k) => cfg.proxyTools[k]).join(', ') || 'выкл')}`)
+    console.log(`  4  Свои тулы                   ${paint('cyan', ['now', 'web_fetch'].filter((k) => cfg.proxyTools[k]).join(', ') || 'выкл')}`)
     console.log('  0  Назад')
     const choice = await ask('\n  Выбор', '0')
     if (choice === '1') cfg.port = Number(await ask('  Новый порт', String(cfg.port))) || cfg.port
     else if (choice === '2') cfg.toolEmulation = !cfg.toolEmulation
     else if (choice === '3') cfg.cache.enabled = !cfg.cache.enabled
-    else if (choice === '4') cfg.fallbackModel = await ask('  Модель при ошибке (пусто — выкл)', cfg.fallbackModel || '')
-    else if (choice === '5') {
+    else if (choice === '4') {
       const v = await ask('  Включить (now,web_fetch; пусто — выключить)', 'now,web_fetch')
       for (const k of ['now', 'web_fetch']) cfg.proxyTools[k] = v.split(',').map((s) => s.trim()).includes(k)
     } else if (choice === '0') return cfg
