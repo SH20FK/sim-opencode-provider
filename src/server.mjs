@@ -482,11 +482,20 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
       limiter.note(res, data)
       if (!res.ok) {
         const msg = (data.error && (data.error.message || data.error.code)) || `HTTP ${res.status}`
-        if (res.status === 429 && attempt < 2) {
-          lastErr = new Error(`Sim 429: ${msg}`)
-          stats.rateLimited = (stats.rateLimited || 0) + 1
-          await limiter.waitForReset()
-          continue
+        if (res.status === 429) {
+          const wait = limiter.state().waitMs
+          // One wait for the window is fine; a second one would keep the caller
+          // hanging for minutes, so hand the 429 back instead.
+          if (attempt === 0 && wait > 0) {
+            lastErr = new Error(`Sim 429: ${msg}`)
+            stats.rateLimited = (stats.rateLimited || 0) + 1
+            await limiter.waitForReset()
+            continue
+          }
+          const err = new Error(`Sim 429: ${msg} (Sim limit is 60 requests per minute)`)
+          err.status = 429
+          err.retryAfterMs = Math.max(1000, wait)
+          throw err
         }
         if (res.status >= 500 && attempt < 2) {
           lastErr = new Error(`Sim ${res.status}: ${msg}`)
@@ -1289,6 +1298,11 @@ async function handleChat(req, res) {
     if (early.sent) {
       if (!res.writableEnded) res.end(JSON.stringify({ error: { message: msg, type: 'upstream_error', code: status } }))
       return
+    }
+    if (status === 429) {
+      const wait = err && err.retryAfterMs ? Math.ceil(err.retryAfterMs / 1000) : 30
+      res.setHeader('Retry-After', String(wait))
+      res.setHeader('X-RateLimit-Limit', '60')
     }
     return openaiError(res, status, msg, 'upstream_error')
   }

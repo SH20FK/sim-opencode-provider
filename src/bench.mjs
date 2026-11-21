@@ -28,18 +28,28 @@ const TOOLS = [
   },
 ]
 
-async function proxyCall({ proxyUrl, token, body, timeoutMs = 240000 }) {
+async function proxyCall({ proxyUrl, token, body, timeoutMs = 300000 }) {
   const headers = { 'Content-Type': 'application/json', 'X-Sim-No-Cache': '1' }
   if (token) headers.Authorization = `Bearer ${token}`
   const t0 = Date.now()
-  const res = await fetch(`${proxyUrl}/v1/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
-  })
-  const data = await res.json().catch(() => ({}))
-  return { ms: Date.now() - t0, status: res.status, data }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`${proxyUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (res.status === 429 && attempt < 2) {
+      // The proxy tells us when Sim's window resets.
+      const wait = Number(res.headers.get('retry-after') || 5)
+      await res.text().catch(() => '')
+      await new Promise((r) => setTimeout(r, Math.min(65000, Math.max(1000, wait * 1000)) + 250))
+      continue
+    }
+    const data = await res.json().catch(() => ({}))
+    return { ms: Date.now() - t0, status: res.status, data }
+  }
+  return { ms: Date.now() - t0, status: 429, data: { error: { message: 'rate limited' } } }
 }
 
 function parseJsonLoose(text) {
@@ -64,12 +74,18 @@ async function benchOne(model, ctx) {
 
   try {
     // Speed goes through the proxy too, so the shared rate limiter sees it.
-    const speed = await proxyCall({ ...ctx, body: { model, messages: [{ role: 'user', content: SPEED_PROMPT }] } })
+    const speed = await proxyCall({
+      ...ctx,
+      timeoutMs: 600000,
+      body: { model, messages: [{ role: 'user', content: SPEED_PROMPT }] },
+    })
     const data = speed.data || {}
     const content =
       (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || ''
     if (speed.status !== 200 || !content) {
-      row.error = (data.error && data.error.message) || `HTTP ${speed.status}`
+      row.error =
+        (data.error && data.error.message) ||
+        (speed.status === 200 ? 'пустой ответ (0 символов)' : `HTTP ${speed.status}`)
       return row
     }
     const outTokens = (data.usage && data.usage.completion_tokens) || 0

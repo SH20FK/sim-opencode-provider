@@ -474,7 +474,7 @@ async function runBenchCommand(cfg, args = []) {
   const modelsArg = (args.find((a) => a.startsWith('--models=')) || '').slice('--models='.length)
   const limitArg = Number((args.find((a) => a.startsWith('--limit=')) || '').slice('--limit='.length)) || 0
   const concRaw = args.find((a) => a.startsWith('--concurrency='))
-  const concurrency = concRaw ? Number(concRaw.slice('--concurrency='.length)) : 8
+  const concurrency = concRaw ? Number(concRaw.slice('--concurrency='.length)) : 4
 
   let models = modelsArg
     ? modelsArg.split(',').map((s) => s.trim()).filter(Boolean)
