@@ -32,7 +32,7 @@ const DEFAULTS = {
   requestTimeoutMs: 290000,
   fallbackModel: '',
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
-  proxyTools: { now: true, web_fetch: true, web_search: true },
+  proxyTools: { now: true, web_fetch: true },
   nudge: { enabled: true, maxRetries: 2 },
   chunking: { enabled: true, maxParts: 24 },
   contextDedupe: { enabled: true, minChars: 1500, staleReads: true },
@@ -275,39 +275,6 @@ const PROXY_TOOLS = {
       const text = /html|xml/i.test(type) ? htmlToText(body) : body.trim()
       const limit = Math.min(Math.max(Number(max_chars) || 8000, 500), 40000)
       return `HTTP ${res.status} ${type}\n\n${text.slice(0, limit)}${text.length > limit ? `\n...[truncated ${text.length - limit} chars]` : ''}`
-    },
-  },
-  web_search: {
-    spec: {
-      name: 'web_search',
-      description: 'Search the web (DuckDuckGo) and return the top results as title, url and snippet.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'Search query' },
-          limit: { type: 'number', description: 'Max results, default 5' },
-        },
-        required: ['query'],
-      },
-    },
-    run: async ({ query, limit }) => {
-      const res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(String(query))}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-        signal: AbortSignal.timeout(20000),
-      })
-      const html = await res.text()
-      const n = Math.min(Math.max(Number(limit) || 5, 1), 10)
-      const out = []
-      const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|div)>)?/g
-      let m
-      while ((m = re.exec(html)) !== null && out.length < n) {
-        let href = m[1]
-        const uddg = /[?&]uddg=([^&]+)/.exec(href)
-        if (uddg) href = decodeURIComponent(uddg[1])
-        out.push({ title: htmlToText(m[2]).slice(0, 200), url: href, snippet: htmlToText(m[3] || '').slice(0, 300) })
-      }
-      if (!out.length) return 'No results (search engine returned an empty page).'
-      return out.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join('\n')
     },
   },
 }

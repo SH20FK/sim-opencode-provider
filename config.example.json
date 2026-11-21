@@ -18,8 +18,7 @@
   },
   "proxyTools": {
     "now": true,
-    "web_fetch": true,
-    "web_search": true
+    "web_fetch": true
   },
   "nudge": {
     "enabled": true,

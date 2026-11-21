@@ -70,7 +70,7 @@ const DEFAULTS = {
   toolEmulation: true, toolTemperature: 0, maxConcurrent: 2, requestTimeoutMs: 290000,
   fallbackModel: '',
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
-  proxyTools: { now: true, web_fetch: true, web_search: true },
+  proxyTools: { now: true, web_fetch: true },
   nudge: { enabled: true, maxRetries: 2 },
   maxProxyToolHops: 3,
 }
@@ -745,7 +745,7 @@ async function settingsMenu(cfg) {
     console.log(`  2  Эмуляция тулов             ${paint('cyan', cfg.toolEmulation ? 'вкл' : 'выкл')}`)
     console.log(`  3  Кеш ответов                ${paint('cyan', cfg.cache.enabled ? 'вкл' : 'выкл')}`)
     console.log(`  4  Fallback-модель            ${paint('cyan', cfg.fallbackModel || '—')}`)
-    console.log(`  5  Свои тулы                   ${paint('cyan', ['now', 'web_fetch', 'web_search'].filter((k) => cfg.proxyTools[k]).join(', ') || 'выкл')}`)
+    console.log(`  5  Свои тулы                   ${paint('cyan', ['now', 'web_fetch'].filter((k) => cfg.proxyTools[k]).join(', ') || 'выкл')}`)
     console.log('  0  Назад')
     const choice = await ask('\n  Выбор', '0')
     if (choice === '1') cfg.port = Number(await ask('  Новый порт', String(cfg.port))) || cfg.port
@@ -753,8 +753,8 @@ async function settingsMenu(cfg) {
     else if (choice === '3') cfg.cache.enabled = !cfg.cache.enabled
     else if (choice === '4') cfg.fallbackModel = await ask('  Модель при ошибке (пусто — выкл)', cfg.fallbackModel || '')
     else if (choice === '5') {
-      const v = await ask('  Включить (now,web_fetch,web_search; пусто — выключить)', 'now,web_fetch,web_search')
-      for (const k of ['now', 'web_fetch', 'web_search']) cfg.proxyTools[k] = v.split(',').map((s) => s.trim()).includes(k)
+      const v = await ask('  Включить (now,web_fetch; пусто — выключить)', 'now,web_fetch')
+      for (const k of ['now', 'web_fetch']) cfg.proxyTools[k] = v.split(',').map((s) => s.trim()).includes(k)
     } else if (choice === '0') return cfg
     saveConfig(cfg)
     ok('Сохранено (применится после перезапуска прокси)')
