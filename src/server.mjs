@@ -14,6 +14,7 @@ import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createRateLimiter } from './ratelimit.mjs'
 import { sanitizeModelText, hasBrFlood } from './sanitize.mjs'
+import { normalizeCalls, extractCallLines, extractJsonCalls, extractXmlCalls, stripToolArtifacts } from './toolcalls.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
@@ -601,128 +602,10 @@ function toolSpecPrompt(tools) {
   ].join('\n')
 }
 
-function normalizeCalls(obj, allowed) {
-  let raw = null
-  if (Array.isArray(obj)) raw = obj
-  else if (obj && Array.isArray(obj.tool_calls)) raw = obj.tool_calls
-  else if (obj && Array.isArray(obj.toolCalls)) raw = obj.toolCalls
-  else if (obj && Array.isArray(obj.calls)) raw = obj.calls
-  else if (obj && typeof obj.name === 'string' && (obj.arguments || obj.parameters || obj.input)) raw = [obj]
-  else if (obj && obj.function && typeof obj.function.name === 'string') raw = [{ ...obj.function }]
-  if (!raw || !raw.length) return null
 
-  const calls = []
-  for (const item of raw) {
-    const fn = item.function || item
-    const name = fn.name || fn.tool || fn.tool_name
-    if (typeof name !== 'string' || (allowed && !allowed.has(name))) continue
-    let args = fn.arguments ?? fn.parameters ?? fn.args ?? fn.input ?? {}
-    if (typeof args === 'string') {
-      const trimmed = args.trim()
-      if (trimmed && !/^[[{"]/.test(trimmed)) continue
-      try {
-        args = JSON.parse(trimmed || '{}')
-      } catch {
-        continue
-      }
-    }
-    calls.push({ name, arguments: JSON.stringify(args ?? {}) })
-  }
-  return calls.length ? calls : null
-}
 
-function jsonCandidates(text) {
-  const out = []
-  const sources = [text.replace(/```[a-zA-Z]*\s*([\s\S]*?)```/g, '$1'), text]
-  for (const src of sources) {
-    for (let i = 0; i < src.length && out.length < 60; i++) {
-      if (src[i] !== '{') continue
-      let depth = 0
-      let inStr = false
-      let esc = false
-      for (let j = i; j < src.length; j++) {
-        const c = src[j]
-        if (inStr) {
-          if (esc) esc = false
-          else if (c === '\\') esc = true
-          else if (c === '"') inStr = false
-          continue
-        }
-        if (c === '"') inStr = true
-        else if (c === '{') depth++
-        else if (c === '}') {
-          depth--
-          if (depth === 0) {
-            out.push(src.slice(i, j + 1))
-            i = j
-            break
-          }
-        }
-      }
-    }
-    if (out.length) break
-  }
-  return out
-}
 
-function extractJsonCalls(text, tools) {
-  if (!tools || !tools.length || text.length > 40000) return null
-  const allowed = new Set(tools.map((t) => (t.function || t).name))
-  for (const candidate of jsonCandidates(text)) {
-    let parsed
-    try {
-      parsed = JSON.parse(candidate)
-    } catch {
-      continue
-    }
-    const calls = normalizeCalls(parsed, allowed)
-    if (calls) return calls
-  }
-  return null
-}
 
-function extractXmlCalls(text, tools) {
-  if (!tools || !tools.length) return null
-  const allowed = new Set(tools.map((t) => (t.function || t).name))
-  const calls = []
-  const invokeRe = /<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/g
-  let m
-  while ((m = invokeRe.exec(text)) !== null) {
-    const attrs = m[1] || ''
-    const inner = m[2] || ''
-    const nameMatch = /name\s*=\s*"([^"]+)"/.exec(attrs) || /name\s*=\s*'([^']+)'/.exec(attrs)
-    let name = nameMatch && nameMatch[1]
-    if (!name) {
-      const t = /<tool_name>([\s\S]*?)<\/tool_name>/.exec(inner)
-      name = t && t[1].trim()
-    }
-    if (!name || !allowed.has(name)) continue
-    const args = {}
-    const paramRe = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/g
-    let p
-    while ((p = paramRe.exec(inner)) !== null) {
-      const key = (/(?:name|key)\s*=\s*"([^"]+)"/.exec(p[1] || '') || [])[1]
-      if (!key) continue
-      const rawValue = p[2].trim()
-      let value = rawValue
-      if (/^[[{]/.test(rawValue)) {
-        try {
-          value = JSON.parse(rawValue)
-        } catch {}
-      }
-      args[key] = value
-    }
-    calls.push({ name, arguments: JSON.stringify(args) })
-  }
-  return calls.length ? calls : null
-}
-
-const stripXml = (text) =>
-  text
-    .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
-    .replace(/<invoke\b[^>]*>[\s\S]*?<\/invoke>/g, '')
-    .replace(/<\/?antml:[^>]*>/g, '')
-    .trim()
 
 // Coerce one argument against its JSON-schema fragment.
 function coerceValue(value, def) {
@@ -803,7 +686,7 @@ function repairCalls(calls, tools) {
 }
 
 const looksLikeFailedCall = (text) =>
-  /<invoke|tool_calls|"arguments"|"parameters"|```json/i.test(text) && text.length < 4000
+  /<invoke|<invoke_tool|tool_calls|"arguments"|_call:|```json/i.test(text) && text.length < 4000
 
 function canonCall(call) {
   try {
@@ -1382,10 +1265,10 @@ async function handleChat(req, res) {
 
         calls = null
         if (emulation) {
-          calls = extractJsonCalls(content, tools) || extractXmlCalls(content, tools)
+          calls = extractJsonCalls(content, tools) || extractXmlCalls(content, tools) || extractCallLines(content, tools)
           if (calls) {
             calls = repairCalls(calls, tools)
-            if (/<invoke|<function_calls/i.test(content)) content = stripXml(content)
+            content = stripToolArtifacts(content)
           }
         }
 
@@ -1410,9 +1293,10 @@ async function handleChat(req, res) {
             bump(model, Date.now() - startedAll, (retry.tokens && retry.tokens.input) || 0, (retry.tokens && retry.tokens.output) || 0)
             content = retry.content
             tokens = retry.tokens
-            calls = extractJsonCalls(content, tools) || extractXmlCalls(content, tools)
+            calls = extractJsonCalls(content, tools) || extractXmlCalls(content, tools) || extractCallLines(content, tools)
             if (calls) {
               calls = repairCalls(calls, tools)
+              content = stripToolArtifacts(content)
               fixed = true
             }
           }
