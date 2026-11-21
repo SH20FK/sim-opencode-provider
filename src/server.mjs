@@ -26,7 +26,7 @@ const DEFAULTS = {
   port: 8787,
   toolEmulation: true,
   toolTemperature: 0,
-  maxConcurrent: 2,
+  maxConcurrent: 0,
   requestTimeoutMs: 290000,
   fallbackModel: '',
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200 },
@@ -157,7 +157,12 @@ class Semaphore {
     else this.free++
   }
 }
-const gate = new Semaphore(Math.max(1, cfg.maxConcurrent || 2))
+// A configured limit above zero caps parallel Sim calls; 0 (or less) means no cap.
+const gateLimit = Number(cfg.maxConcurrent)
+const gate =
+  gateLimit > 0
+    ? new Semaphore(gateLimit)
+    : { acquire: () => Promise.resolve(), release: () => {} }
 
 // ------------------------------------------------------------------- models
 let models = { at: 0, hosted: [], all: [] }

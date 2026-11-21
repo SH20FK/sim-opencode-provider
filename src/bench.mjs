@@ -148,7 +148,7 @@ async function benchOne(model, ctx) {
 }
 
 export async function runBench(options, onProgress = () => {}) {
-  const { models, concurrency = 2 } = options
+  const { models, concurrency = 4 } = options
   const results = new Array(models.length)
   let next = 0
   let done = 0
@@ -163,7 +163,7 @@ export async function runBench(options, onProgress = () => {}) {
     }
   }
 
-  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, 4)) }, worker))
+  await Promise.all(Array.from({ length: Math.max(1, concurrency > 0 ? Math.min(concurrency, models.length) : models.length) }, worker))
   return results.filter(Boolean)
 }
 

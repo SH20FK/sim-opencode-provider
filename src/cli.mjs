@@ -472,6 +472,8 @@ async function runBenchCommand(cfg, args = []) {
   const all = args.includes('--all')
   const modelsArg = (args.find((a) => a.startsWith('--models=')) || '').slice('--models='.length)
   const limitArg = Number((args.find((a) => a.startsWith('--limit=')) || '').slice('--limit='.length)) || 0
+  const concRaw = args.find((a) => a.startsWith('--concurrency='))
+  const concurrency = concRaw ? Number(concRaw.slice('--concurrency='.length)) : 8
 
   let models = modelsArg
     ? modelsArg.split(',').map((s) => s.trim()).filter(Boolean)
@@ -491,7 +493,11 @@ async function runBenchCommand(cfg, args = []) {
   }
 
   console.log(paint('bold', `\n  Замер ${models.length} моделей`))
-  info('  скорость — напрямую в Sim, тул и JSON — через прокси. Две модели параллельно.\n')
+  info(
+    `  скорость — напрямую в Sim, тул и JSON — через прокси. ` +
+      (concurrency > 0 ? `По ${concurrency} моделей параллельно.` : 'Без ограничения параллельности.') +
+      '\n',
+  )
   const t0 = Date.now()
   const rows = await runBench(
     {
@@ -500,7 +506,7 @@ async function runBenchCommand(cfg, args = []) {
       proxyUrl: `http://127.0.0.1:${cfg.port}`,
       token: cfg.localToken,
       models,
-      concurrency: 2,
+      concurrency,
     },
     (done, total, row) => {
       const speed = row.speed ? `${row.speed.tokPerSec} tok/s` : row.error || '—'

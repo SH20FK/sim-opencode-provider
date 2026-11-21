@@ -5,7 +5,7 @@
   "port": 8787,
   "toolEmulation": true,
   "toolTemperature": 0,
-  "maxConcurrent": 2,
+  "maxConcurrent": 0,
   "requestTimeoutMs": 290000,
   "fallbackModel": "gpt-5.3-codex",
   "cache": {
