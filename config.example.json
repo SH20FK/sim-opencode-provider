@@ -1,0 +1,26 @@
+{
+  "simApiKey": "sk-sim-REPLACE_ME",
+  "workspaceId": "REPLACE_ME",
+  "workflowId": "",
+  "port": 8787,
+  "toolEmulation": true,
+  "toolTemperature": 0,
+  "maxConcurrent": 2,
+  "requestTimeoutMs": 290000,
+  "fallbackModel": "claude-sonnet-5-5",
+  "cache": {
+    "enabled": true,
+    "ttlMs": 600000,
+    "maxEntries": 200
+  },
+  "proxyTools": {
+    "now": true,
+    "web_fetch": true,
+    "web_search": true
+  },
+  "nudge": {
+    "enabled": true,
+    "maxRetries": 2
+  },
+  "maxProxyToolHops": 3
+}
