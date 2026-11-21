@@ -14,8 +14,11 @@ import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const CONFIG_PATH = path.join(__dirname, 'config.json')
-const MODELS_CACHE = path.join(__dirname, 'models.cache.json')
+const ROOT = path.resolve(__dirname, '..')
+const CONFIG_PATH = process.env.SIM_PROVIDER_CONFIG
+  ? path.resolve(process.env.SIM_PROVIDER_CONFIG)
+  : path.join(ROOT, 'config.json')
+const MODELS_CACHE = path.join(ROOT, 'models.cache.json')
 
 const DEFAULTS = {
   simApiKey: '',

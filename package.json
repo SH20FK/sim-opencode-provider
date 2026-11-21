@@ -4,16 +4,17 @@
   "private": false,
   "type": "module",
   "description": "OpenAI-compatible proxy that serves Sim's hosted models to OpenCode, with emulated tool calling",
-  "keywords": ["opencode", "sim", "openai-compatible", "proxy", "llm", "tool-calling", "mcp"],
+  "keywords": ["opencode", "sim", "openai-compatible", "proxy", "llm", "tool-calling", "claude", "gpt"],
   "license": "MIT",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "start": "node server.mjs",
-    "setup": "node cli.mjs setup",
-    "manage": "node cli.mjs",
+    "start": "node src/server.mjs",
+    "setup": "node src/cli.mjs setup",
+    "manage": "node src/cli.mjs",
+    "opencode:install": "node src/cli.mjs opencode-install",
     "test:smoke": "node tests/smoke.mjs",
-    "check": "node --check server.mjs && node --check cli.mjs"
+    "check": "node --check src/server.mjs && node --check src/cli.mjs && node --check src/opencode.mjs"
   }
 }
