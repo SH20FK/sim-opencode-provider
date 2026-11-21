@@ -33,7 +33,7 @@ const DEFAULTS = {
   simTimeoutSec: 300,
   fallbackModel: '',
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
-  streamPacing: { enabled: true, chunkChars: 48, delayMs: 25 },
+  streamPacing: { enabled: false, chunkChars: 12, delayMs: 20 },
   proxyTools: { now: true, web_fetch: true },
   nudge: { enabled: true, maxRetries: 2 },
   chunking: { enabled: true, maxParts: 24 },
@@ -1279,18 +1279,29 @@ async function handleChat(req, res) {
 
   // Sim returns a part whole, so without pacing the client gets one wall of
   // text per call. Sending it in small slices makes it read like typing.
-  const paceChars = Math.max(8, Number((cfg.streamPacing && cfg.streamPacing.chunkChars) || 48))
-  const paceDelay = Math.max(0, Number((cfg.streamPacing && cfg.streamPacing.delayMs) || 0))
-  const pacing = cfg.streamPacing ? cfg.streamPacing.enabled !== false : true
+  const paceChars = Math.max(4, Number((cfg.streamPacing && cfg.streamPacing.chunkChars) || 12))
+  const paceDelay = Math.max(0, Number((cfg.streamPacing && cfg.streamPacing.delayMs) || 20))
+  const pacing = cfg.streamPacing ? cfg.streamPacing.enabled === true : false
 
   const sendContent = async (text) => {
-    for (let i = 0; i < text.length; i += paceChars) {
+    // Pace against a deadline instead of sleeping after every slice: that keeps
+    // the cadence even when a write takes longer than the slice interval.
+    const step = pacing ? paceChars : 120
+    const started = Date.now()
+    let sent = 0
+    for (let i = 0; i < text.length; i += step) {
       if (res.writableEnded || res.destroyed || controller.signal.aborted) return
+      const piece = text.slice(i, i + step)
       sendSse(res, {
         id, object: 'chat.completion.chunk', created, model,
-        choices: [{ index: 0, delta: { content: text.slice(i, i + paceChars) }, finish_reason: null }],
+        choices: [{ index: 0, delta: { content: piece }, finish_reason: null }],
       })
-      if (pacing && paceDelay > 0 && i + paceChars < text.length) await sleep(paceDelay)
+      sent += piece.length
+      if (pacing && paceDelay > 0) {
+        const target = started + (sent / step) * paceDelay
+        const wait = target - Date.now()
+        if (wait > 0) await sleep(wait)
+      }
     }
   }
 

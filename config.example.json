@@ -18,9 +18,9 @@
     "ttlByModel": {}
   },
   "streamPacing": {
-    "enabled": true,
-    "chunkChars": 48,
-    "delayMs": 25
+    "enabled": false,
+    "chunkChars": 12,
+    "delayMs": 20
   },
   "proxyTools": {
     "now": true,

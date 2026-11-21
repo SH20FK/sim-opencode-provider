@@ -75,7 +75,7 @@ const DEFAULTS = {
   simTimeoutSec: 300,
   fallbackModel: '',
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
-  streamPacing: { enabled: true, chunkChars: 48, delayMs: 25 },
+  streamPacing: { enabled: false, chunkChars: 12, delayMs: 20 },
   proxyTools: { now: true, web_fetch: true },
   nudge: { enabled: true, maxRetries: 2 },
   maxProxyToolHops: 3,
