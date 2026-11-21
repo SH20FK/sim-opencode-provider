@@ -12,7 +12,8 @@ import fs from 'node:fs'
 const SIM = 'https://www.sim.ai/api/v2'
 
 const SPEED_PROMPT = 'Напиши связный текст примерно на 150 слов про море, маяки и корабли. Без заголовков и списков.'
-const JSON_PROMPT = 'Ответь ровно этим JSON и ничего больше, без пояснений и без markdown: {"ok":true,"n":2}'
+const JSON_PROMPT =
+  'Ответь только JSON-объектом с полями ok (логическое true) и n (число 2). Без пояснений, без markdown, без текста вокруг.'
 const TOOL_PROMPT = 'Прочитай файл package.json и скажи, какая там версия. Сначала вызови инструмент read.'
 
 const TOOLS = [
@@ -132,7 +133,13 @@ async function benchOne(model, ctx) {
     const json = await proxyCall({ ...ctx, body: { model, messages: [{ role: 'user', content: JSON_PROMPT }] } })
     const content = (json.data.choices && json.data.choices[0] && json.data.choices[0].message && json.data.choices[0].message.content) || ''
     const parsed = parseJsonLoose(content)
-    row.json = { ok: Boolean(parsed && parsed.ok === true && parsed.n === 2), seconds: Math.round(json.ms / 100) / 10 }
+    // The probe tests "can it answer with JSON", not "can it echo a literal".
+    const ok = Boolean(parsed && (parsed.ok === true || parsed.ok === 'true') && Number(parsed.n) === 2)
+    row.json = {
+      ok,
+      seconds: Math.round(json.ms / 100) / 10,
+      snippet: ok ? undefined : String(content).replace(/\s+/g, ' ').slice(0, 100),
+    }
   } catch (err) {
     row.json = { ok: false, error: String(err.message || err).slice(0, 80) }
   }
@@ -166,10 +173,13 @@ function verdict(row) {
   const jsonOk = row.json && row.json.ok
   const tps = (row.speed && row.speed.tokPerSec) || 0
   if (toolOk && jsonOk && tps >= 25) return 'агент'
-  if (toolOk && tps >= 8) return 'агент (медленный)'
+  if (toolOk && jsonOk) return 'агент (медленный)'
+  if (toolOk && !jsonOk) return 'тул ок, JSON нет'
   if (!toolOk && row.speed) return 'только текст'
   return '—'
 }
+
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
 export function renderTableHtml(rows, meta = {}) {
   const when = new Date().toISOString().replace('T', ' ').slice(0, 16)
@@ -177,17 +187,19 @@ export function renderTableHtml(rows, meta = {}) {
     .map((r) => {
       const sp = r.speed || {}
       const price = r.price ? `$${r.price.input} / $${r.price.output}` : '—'
-      const tool = r.tool ? (r.tool.name === 'read' && r.tool.argsOk ? '✓' : r.tool.name ? `~ ${r.tool.name}` : '✗') : '—'
-      const json = r.json ? (r.json.ok ? '✓' : '✗') : '—'
+      const toolMark = r.tool ? (r.tool.name === 'read' && r.tool.argsOk ? '✓' : r.tool.name ? `~ ${r.tool.name}` : '✗') : '—'
+      const toolTitle = r.tool ? (r.tool.error || `name: ${r.tool.name || '—'}, args ok: ${r.tool.argsOk}`) : ''
+      const jsonMark = r.json ? (r.json.ok ? '✓' : '✗') : '—'
+      const jsonTitle = r.json ? r.json.error || r.json.snippet || 'ok' : ''
       return `<tr>
-        <td class="m">${r.model}</td>
+        <td class="m">${esc(r.model)}</td>
         <td>${price}</td>
         <td>${sp.seconds ?? '—'}</td>
         <td>${sp.tokPerSec ?? '—'}</td>
         <td>${sp.reasoningPct != null ? `${sp.reasoningPct}%` : '—'}</td>
-        <td class="${tool === '✓' ? 'ok' : tool === '✗' ? 'bad' : ''}">${tool}</td>
-        <td class="${json === '✓' ? 'ok' : json === '✗' ? 'bad' : ''}">${json}</td>
-        <td class="v">${r.error ? `<span class="bad">${String(r.error).slice(0, 60)}</span>` : verdict(r)}</td>
+        <td class="${toolMark === '✓' ? 'ok' : toolMark === '✗' ? 'bad' : ''}" title="${esc(toolTitle)}">${esc(toolMark)}</td>
+        <td class="${jsonMark === '✓' ? 'ok' : jsonMark === '✗' ? 'bad' : ''}" title="${esc(jsonTitle)}">${jsonMark}</td>
+        <td class="v">${r.error ? `<span class="bad">${esc(String(r.error).slice(0, 60))}</span>` : esc(verdict(r))}</td>
       </tr>`
     })
     .join('\n')
