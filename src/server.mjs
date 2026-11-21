@@ -114,7 +114,6 @@ const stats = {
   fallbacks: 0,
   upstreamRetries: 0,
   unparsedCalls: 0,
-  duplicateCalls: 0,
   brFloods: 0,
   dedupedResults: 0,
   lastErrors: [],
@@ -720,14 +719,6 @@ function canonCall(call) {
   }
 }
 
-function alreadyExecutedCalls(transcript) {
-  const set = new Set()
-  const re = /\[tool call ([^\s#]+) #[^\]]*\]\n([^\n]*)/g
-  let m
-  while ((m = re.exec(transcript)) !== null) set.add(canonCall({ name: m[1], arguments: m[2] }))
-  return set
-}
-
 // -------------------------------------------------------------- transcript
 function contentToText(content) {
   if (typeof content === 'string') return content
@@ -1250,6 +1241,7 @@ async function handleChat(req, res) {
 
     if (!usedCache) {
       let workingContext = [transcript, toolBlock].filter(Boolean).join('\n\n')
+      const ranThisRequest = new Set()
 
       for (let hop = 0; hop <= (cfg.maxProxyToolHops || 3); hop++) {
         hops = hop
@@ -1335,42 +1327,18 @@ async function handleChat(req, res) {
 
         if (!calls) break
 
-        // Dedup: identical call already present in history.
-        const done = alreadyExecutedCalls(workingContext)
-        const fresh = calls.filter((c) => !done.has(canonCall(c)))
-        if (!fresh.length) {
-          workingContext +=
-            `\n\n[assistant]\n${JSON.stringify({ tool_calls: calls })}\n\n[user]\nThose exact calls already ran and their results are above. Do not repeat them; continue with the answer.`
-          stats.nudges++
-          let retry = null
-          try {
-            retry = await simChatChunked({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
-          } catch (err) {
-            stats.nudgeFailures = (stats.nudgeFailures || 0) + 1
-            log(`dedup retry for ${model} failed: ${short(err.message, 160)}`)
-          }
-          calls = null
-          if (retry) {
-            bump(model, Date.now() - startedAll, (retry.tokens && retry.tokens.input) || 0, (retry.tokens && retry.tokens.output) || 0)
-            content = retry.content
-            tokens = retry.tokens
-            // If the model repeated the call anyway, its JSON must never reach
-            // the chat as text: strip it and answer with what prose is left.
-            const repeat = emulation
-              ? extractJsonCalls(content, tools) || extractXmlCalls(content, tools) || extractCallLines(content, tools) || extractBareInvokes(content, tools)
-              : null
-            if (repeat) {
-              stats.duplicateCalls = (stats.duplicateCalls || 0) + 1
-              content = stripToolArtifacts(content)
-            }
-          } else {
-            // Never hand the client the same tool calls again: it would run them twice.
-            content = ''
-          }
-          if (!content) content = 'Повторный вызов не выполнен, чтобы не выполнить его дважды. Скажи «продолжай».'
-          break
-        }
-        calls = fresh
+        // Collapse duplicate calls inside one answer, and proxy calls already run
+        // in this same request. A call that ran in an earlier turn is allowed:
+        // after "continue" a model often repeats a read or a search, and blocking
+        // it just stalls the loop with no answer.
+        const seenCalls = new Set()
+        calls = calls.filter((c) => {
+          const key = canonCall(c)
+          if (seenCalls.has(key) || ranThisRequest.has(key)) return false
+          seenCalls.add(key)
+          return true
+        })
+        if (!calls.length) break
 
         const proxyCalls = calls.filter((c) => proxyNames.has(c.name))
         if (!proxyCalls.length) break
@@ -1394,6 +1362,7 @@ async function handleChat(req, res) {
         }
 
         if (proxyCalls.length === calls.length) {
+          for (const call of calls) ranThisRequest.add(canonCall(call))
           workingContext += `\n\n[assistant]\n${JSON.stringify({ tool_calls: calls })}\n\n${results.join('\n\n')}`
           continue
         }
