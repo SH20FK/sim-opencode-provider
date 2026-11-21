@@ -26,5 +26,9 @@
   "chunking": {
     "enabled": true,
     "maxParts": 12
+  },
+  "contextDedupe": {
+    "enabled": true,
+    "minChars": 1500
   }
 }

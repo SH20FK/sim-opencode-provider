@@ -7,6 +7,7 @@
 //   node src/cli.mjs autostart-on|autostart-off
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { spawn, execSync } from 'node:child_process'
@@ -21,8 +22,13 @@ const CONFIG_PATH = process.env.SIM_PROVIDER_CONFIG
   ? path.resolve(process.env.SIM_PROVIDER_CONFIG)
   : path.join(ROOT, 'config.json')
 const MODELS_CACHE = path.join(ROOT, 'models.cache.json')
-const LOG_PATH = path.join(ROOT, 'server.log')
-const ERR_PATH = path.join(ROOT, 'server.err.log')
+// Logs live outside the repo folder so it stays clean.
+const LOG_DIR =
+  process.env.SIM_PROVIDER_LOG_DIR ||
+  path.join(process.env.LOCALAPPDATA || process.env.APPDATA || os.tmpdir(), 'sim-opencode-provider')
+const LOG_PATH = path.join(LOG_DIR, 'server.log')
+const ERR_PATH = path.join(LOG_DIR, 'server.err.log')
+const LOG_MAX_BYTES = 2 * 1024 * 1024
 const SIM = 'https://www.sim.ai/api/v2'
 const VERSION = '2.0'
 
@@ -88,11 +94,17 @@ const baseURL = (cfg) => `http://127.0.0.1:${cfg.port}/v1`
 const rl = readline.createInterface({ input, output })
 const ask = (q, def = '') =>
   new Promise((resolve) => {
-    rl.question(`${q}${def ? paint('gray', ` [${def}]`) : ''}: `, (a) => resolve((a || '').trim() || def))
+    if (rl.closed) process.exit(0)
+    try {
+      rl.question(`${q}${def ? paint('gray', ` [${def}]`) : ''}: `, (a) => resolve((a || '').trim() || def))
+    } catch {
+      process.exit(0)
+    }
   })
 
 function askHidden(q) {
   return new Promise((resolve) => {
+    if (rl.closed) process.exit(0)
     const prompt = `${q}: `
     const orig = rl._writeToOutput
     rl._writeToOutput = (str) => {
@@ -109,6 +121,17 @@ function askHidden(q) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Keep the log files small: one previous copy (.1) is enough for debugging.
+function rotateLog(file, maxBytes = LOG_MAX_BYTES) {
+  try {
+    if (!fs.existsSync(file)) return
+    const { size } = fs.statSync(file)
+    if (size < maxBytes) return
+    fs.rmSync(`${file}.1`, { force: true })
+    fs.renameSync(file, `${file}.1`)
+  } catch {}
+}
 
 async function api(pathname, key, init = {}) {
   const res = await fetch(`${SIM}${pathname}`, {
@@ -176,6 +199,9 @@ async function startServer(cfg, quiet = false) {
     bad(`Порт ${cfg.port} занят другим процессом`)
     return false
   }
+  fs.mkdirSync(LOG_DIR, { recursive: true })
+  rotateLog(LOG_PATH)
+  rotateLog(ERR_PATH)
   const out = fs.openSync(LOG_PATH, 'a')
   const err = fs.openSync(ERR_PATH, 'a')
   const child = spawn(process.execPath, [path.join('src', 'server.mjs')], {
@@ -313,20 +339,19 @@ function setAutostart(on) {
       return
     }
     const vbs = path.join(ROOT, 'start-hidden.vbs')
-    if (!fs.existsSync(vbs)) {
-      fs.writeFileSync(
-        vbs,
-        [
-          "' Auto-generated: starts the proxy without a console window.",
-          'Set fso = CreateObject("Scripting.FileSystemObject")',
-          'dir = fso.GetParentFolderName(WScript.ScriptFullName)',
-          'Set sh = CreateObject("WScript.Shell")',
-          'sh.CurrentDirectory = dir',
-          `sh.Run "cmd /c cd /d """ & dir & """ && node src\\server.mjs >> server.log 2>> server.err.log", 0, False`,
-          '',
-        ].join('\r\n'),
-      )
-    }
+    // Always rewritten: the launcher logic (log location, rotation) lives in the CLI.
+    fs.writeFileSync(
+      vbs,
+      [
+        "' Auto-generated: starts the proxy without a console window.",
+        'Set fso = CreateObject("Scripting.FileSystemObject")',
+        'dir = fso.GetParentFolderName(WScript.ScriptFullName)',
+        'Set sh = CreateObject("WScript.Shell")',
+        'sh.CurrentDirectory = dir',
+        'sh.Run "cmd /c cd /d """ & dir & """ && node src\\cli.mjs start", 0, False',
+        '',
+      ].join('\r\n'),
+    )
     const ps1 = path.join(ROOT, '.autostart.ps1')
     const esc = (s) => s.replace(/'/g, "''")
     fs.writeFileSync(
@@ -359,6 +384,7 @@ async function showStatus(cfg) {
     return
   }
   const st = (await proxyFetch(cfg, '/stats')).body || {}
+  const cred = (await proxyFetch(cfg, '/credits')).body || {}
   const avg = st.chatRequests ? Math.round((st.latencyMs || 0) / st.chatRequests) : 0
   console.log(`\n  ${paint('green', 'работает')}  uptime ${Math.floor(health.uptimeSec / 60)} мин  ·  порт ${cfg.port}`)
   console.log(`  моделей ${health.models}  ·  эмуляция тулов ${health.toolEmulation ? 'вкл' : 'выкл'}  ·  кеш ${health.cache ? 'вкл' : 'выкл'}`)
@@ -367,11 +393,30 @@ async function showStatus(cfg) {
     `  запросов ${st.chatRequests || 0}  ·  тул-вызовов ${st.emulatedToolCalls || 0}  ·  своих ${st.proxyToolRuns || 0}` +
       `  ·  кеш-хитов ${st.cacheHits || 0}  ·  ошибок ${st.errors || 0}`,
   )
+  console.log(
+    `  таймаутов ${st.timeouts || 0}  ·  собрано из частей ${st.chunks || 0}` +
+      (st.chunkShrinks ? `  ·  урезано ${st.chunkShrinks}` : '') +
+      `  ·  fallback ${st.fallbacks || 0}` +
+      (st.emptyRetries ? `  ·  пустых повторов ${st.emptyRetries}` : '') +
+      (st.dedupedResults ? `  ·  дублей в контексте ${st.dedupedResults}` : ''),
+  )
   console.log(`  токенов ${st.tokensIn || 0} in / ${st.tokensOut || 0} out  ·  средняя ${avg} мс`)
+  if (cred && cred.credits) {
+    const c = cred.credits
+    console.log(`  Sim: план ${cred.plan || '—'}  ·  кредитов ${c.remaining}/${c.limit}  ·  потрачено ${c.used}`)
+  } else {
+    info('  Sim: остаток кредитов недоступен')
+  }
   const top = Object.entries(st.byModel || {})
     .sort((a, b) => b[1].calls - a[1].calls)
     .slice(0, 4)
   for (const [name, m] of top) info(`    ${name}: ${m.calls} выз., ${Math.round(m.latencyMs / m.calls)} мс`)
+  const sizes = Object.entries(st.chunkSizes || {})
+  if (sizes.length) info(`    части: ${sizes.map(([m, s]) => `${m} → ${s.words} слов`).join(', ')}`)
+  if (Array.isArray(st.lastErrors) && st.lastErrors.length) {
+    info('  последние ошибки:')
+    for (const e of st.lastErrors.slice(0, 3)) info(`    ${String(e.at).slice(11, 19)}  ${e.message}`)
+  }
   console.log()
 }
 
@@ -404,7 +449,7 @@ function tailLog(n = 25) {
     console.log(paint('gray', `\n${path.basename(f)}:`))
     console.log(lines.slice(-n).join('\n'))
   }
-  if (!printed) warn('Логов пока нет')
+  if (!printed) warn(`Логов пока нет (${LOG_DIR})`)
 }
 
 function listModels() {

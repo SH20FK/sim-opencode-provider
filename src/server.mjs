@@ -33,6 +33,7 @@ const DEFAULTS = {
   proxyTools: { now: true, web_fetch: true, web_search: true },
   nudge: { enabled: true, maxRetries: 2 },
   chunking: { enabled: true, maxParts: 12 },
+  contextDedupe: { enabled: true, minChars: 1500 },
   maxProxyToolHops: 3,
 }
 
@@ -57,6 +58,7 @@ function loadConfig() {
     proxyTools: { ...DEFAULTS.proxyTools, ...(raw.proxyTools || {}) },
     nudge: { ...DEFAULTS.nudge, ...(raw.nudge || {}) },
     chunking: { ...DEFAULTS.chunking, ...(raw.chunking || {}) },
+    contextDedupe: { ...DEFAULTS.contextDedupe, ...(raw.contextDedupe || {}) },
   }
 }
 
@@ -83,10 +85,21 @@ const stats = {
   nudges: 0,
   cacheHits: 0,
   errors: 0,
+  timeouts: 0,
+  chunks: 0,
+  chunkShrinks: 0,
+  fallbacks: 0,
+  dedupedResults: 0,
+  lastErrors: [],
   tokensIn: 0,
   tokensOut: 0,
   latencyMs: 0,
   byModel: {},
+}
+
+function rememberError(message) {
+  stats.lastErrors.unshift({ at: new Date().toISOString(), message: short(String(message), 300) })
+  if (stats.lastErrors.length > 5) stats.lastErrors.length = 5
 }
 
 function bump(model, ms, tokensIn, tokensOut) {
@@ -278,17 +291,24 @@ const CONTINUE_MARK = '<<<CONTINUE>>>'
 
 // Sim cuts a single tool call off after ~120 s, and answers that hit max_tokens
 // come back empty. So long answers are produced in parts and stitched together.
-function chunkingInstruction() {
+const DEFAULT_CHUNK = { words: 250, lines: 100 }
+const chunkSizes = new Map()
+
+function chunkSize(model) {
+  return chunkSizes.get(model) || { ...DEFAULT_CHUNK }
+}
+
+function chunkingInstruction(size) {
   return (
-    'Long-answer rule: when your reply would run longer than about 250 words, or you are about to write a file ' +
-    'longer than about 100 lines, do not write it all at once. Write the first part only and end that message ' +
-    `with a line containing exactly ${CONTINUE_MARK}. A tool call that would carry a very large file is split ` +
-    'into several smaller calls instead: write the first half, then append the rest with edit/patch calls. ' +
-    'Otherwise answer normally and never mention this rule.'
+    `Long-answer rule: when your reply would run longer than about ${size.words} words, or you are about to ` +
+    `write a file longer than about ${size.lines} lines, do not write it all at once. Write the first part only ` +
+    `and end that message with a line containing exactly ${CONTINUE_MARK}. A tool call that would carry a very ` +
+    'large file is split into several smaller calls instead: write the first half, then append the rest with ' +
+    'edit/patch calls. Otherwise answer normally and never mention this rule.'
   )
 }
 
-async function simChatChunked({ model, systemPrompt, context, temperature, maxTokens, signal }) {
+async function simChatChunked({ model, systemPrompt, context, temperature, maxTokens, signal, onPart }) {
   if (!cfg.chunking.enabled) return simChat({ model, systemPrompt, context, temperature, maxTokens, signal })
 
   // A large client-side cap would only make Sim return an empty body when hit.
@@ -298,25 +318,44 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
   let ctx = context
   let cost = null
   let hint = ''
+  let size = chunkSize(model)
 
   for (let i = 0; i < (cfg.chunking.maxParts || 12); i++) {
-    const system = [systemPrompt, chunkingInstruction(), hint].filter(Boolean).join('\n\n')
+    const system = [systemPrompt, chunkingInstruction(size), hint].filter(Boolean).join('\n\n')
+    const t0 = Date.now()
     let res
     try {
       res = await simChat({ model, systemPrompt: system, context: ctx, temperature, maxTokens: limit, signal })
     } catch (err) {
-      // A part that is still too long gets one retry with a much smaller budget.
+      // A part that is still too long gets one retry with a smaller budget, and
+      // that budget sticks for the next parts of this model.
       if (err.code === 'TIMEOUT' && !hint) {
-        stats.chunkShrinks = (stats.chunkShrinks || 0) + 1
-        log(`chunk ${i + 1} of ${model} timed out, retrying with a smaller part`)
+        size = {
+          words: Math.max(80, Math.round(size.words * 0.6)),
+          lines: Math.max(40, Math.round(size.lines * 0.6)),
+        }
+        chunkSizes.set(model, size)
+        stats.chunkShrinks++
+        log(`chunk ${i + 1} of ${model} timed out, shrinking to ${size.words} words / ${size.lines} lines`)
         hint =
           `The previous attempt was cut off for being too long. This time write a much shorter part: ` +
-          `at most 100 words (or 40 lines of code), and end it with ${CONTINUE_MARK}.`
+          `at most ${size.words} words (or ${size.lines} lines of code), and end it with ${CONTINUE_MARK}.`
         i--
         continue
       }
       throw err
     }
+    const took = Date.now() - t0
+
+    // Recover the budget slowly when parts finish with plenty of room.
+    if (took < 25000 && (size.words < DEFAULT_CHUNK.words || size.lines < DEFAULT_CHUNK.lines)) {
+      size = {
+        words: Math.min(DEFAULT_CHUNK.words, Math.round(size.words * 1.2)),
+        lines: Math.min(DEFAULT_CHUNK.lines, Math.round(size.lines * 1.2)),
+      }
+      chunkSizes.set(model, size)
+    }
+
     if (res.tokens) {
       tokens.input += res.tokens.input || 0
       tokens.output += res.tokens.output || 0
@@ -327,7 +366,8 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
     if (text.includes(CONTINUE_MARK)) {
       text = text.split(CONTINUE_MARK).join('')
       parts.push(text)
-      stats.chunks = (stats.chunks || 0) + 1
+      stats.chunks++
+      if (onPart) onPart(text, parts.length - 1)
       ctx =
         `${context}\n\n[assistant]\n${parts.join('')}\n\n[user]\n` +
         `Continue exactly where you stopped. Do not repeat anything and do not add commentary. ` +
@@ -335,21 +375,24 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
       continue
     }
     parts.push(text)
+    if (onPart) onPart(text, parts.length - 1)
     return { content: parts.join(''), tokens, cost, chunks: parts.length }
   }
   return { content: parts.join(''), tokens, cost, chunks: parts.length }
 }
 
 async function simChat({ model, systemPrompt, context, temperature, maxTokens, signal }) {
-  const input = { model, context }
-  if (systemPrompt) input.systemPrompt = systemPrompt
-  if (typeof temperature === 'number') input.temperature = temperature
-  if (typeof maxTokens === 'number' && maxTokens > 0) input.maxTokens = maxTokens
-
-  const body = JSON.stringify({ workspaceId: cfg.workspaceId, input })
+  let limit = typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : undefined
   let lastErr
 
   for (let attempt = 0; attempt < 3; attempt++) {
+    const input = { model, context }
+    if (systemPrompt) input.systemPrompt = systemPrompt
+    if (typeof temperature === 'number') input.temperature = temperature
+    if (limit) input.maxTokens = limit
+
+    const body = JSON.stringify({ workspaceId: cfg.workspaceId, input })
+
     await gate.acquire()
     try {
       const timeout = AbortSignal.timeout(cfg.requestTimeoutMs || 290000)
@@ -392,8 +435,17 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
         throw err
       }
       const out = payload.output || {}
+      const answer = typeof out.content === 'string' ? out.content : ''
+      // Sim answers with an empty body when a reply is cut off by maxTokens, so
+      // ask again without the cap instead of handing the client an empty answer.
+      if (!answer && limit && out.tokens && Number(out.tokens.output) >= limit) {
+        stats.emptyRetries = (stats.emptyRetries || 0) + 1
+        log(`empty answer from ${model} at maxTokens=${limit}, retrying without the cap`)
+        limit = undefined
+        continue
+      }
       return {
-        content: typeof out.content === 'string' ? out.content : '',
+        content: answer,
         tokens: out.tokens || null,
         cost: out.cost || null,
       }
@@ -569,12 +621,52 @@ const stripXml = (text) =>
     .replace(/<\/?antml:[^>]*>/g, '')
     .trim()
 
+// Coerce one argument against its JSON-schema fragment.
+function coerceValue(value, def) {
+  if (value === undefined || def == null) return value
+  const type = Array.isArray(def.type) ? def.type[0] : def.type
+  if (type === 'string') {
+    if (typeof value === 'string') return value
+    return typeof value === 'object' ? JSON.stringify(value) : String(value)
+  }
+  if (type === 'number' || type === 'integer') {
+    const n = typeof value === 'number' ? value : Number(String(value).replace(/[,_\s]/g, ''))
+    if (!Number.isNaN(n)) return type === 'integer' ? Math.trunc(n) : n
+    return value
+  }
+  if (type === 'boolean') {
+    if (typeof value === 'boolean') return value
+    const s = String(value).trim().toLowerCase()
+    if (['true', '1', 'yes', 'y', 'on'].includes(s)) return true
+    if (['false', '0', 'no', 'n', 'off', ''].includes(s)) return false
+    return value
+  }
+  if (type === 'array') {
+    const items = def.items
+    if (Array.isArray(value)) return items ? value.map((v) => coerceValue(v, items)) : value
+    return [items ? coerceValue(value, items) : value]
+  }
+  if (type === 'object') {
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value)
+        if (parsed && typeof parsed === 'object') return parsed
+      } catch {}
+    }
+    return value
+  }
+  return value
+}
+
 // Fill/coerce arguments against the tool schema so providers stop rejecting calls.
 function repairCalls(calls, tools) {
   const byName = new Map(tools.map((t) => [(t.function || t).name, t.function || t]))
+  const byLower = new Map(tools.map((t) => [(t.function || t).name.toLowerCase(), t.function || t]))
   const out = []
   for (const call of calls) {
-    const fn = byName.get(call.name)
+    const fn = byName.get(call.name) || byLower.get(String(call.name || '').toLowerCase())
+    const name = (fn && fn.name) || call.name
     let args
     try {
       args = JSON.parse(call.arguments || '{}')
@@ -584,24 +676,25 @@ function repairCalls(calls, tools) {
     if (!args || typeof args !== 'object' || Array.isArray(args)) args = {}
     const schema = (fn && fn.parameters) || {}
     const props = schema.properties || {}
+    const required = schema.required || []
     for (const key of Object.keys(args)) if (Object.keys(props).length && !props[key]) delete args[key]
     for (const [key, def] of Object.entries(props)) {
-      const want = def && def.type
       let value = args[key]
       if (value === undefined || value === null || value === '') {
-        if ((schema.required || []).includes(key)) {
-          args[key] = want === 'number' ? 0 : want === 'boolean' ? false : want === 'array' ? [] : want === 'object' ? {} : ''
+        if (def && def.default !== undefined) args[key] = def.default
+        else if (required.includes(key)) {
+          const want = def && def.type
+          args[key] = want === 'number' || want === 'integer' ? 0 : want === 'boolean' ? false : want === 'array' ? [] : want === 'object' ? {} : ''
         }
         continue
       }
-      if (want === 'string' && typeof value !== 'string') args[key] = String(value)
-      else if (want === 'number' && typeof value !== 'number') {
-        const n = Number(value)
-        if (!Number.isNaN(n)) args[key] = n
-      } else if (want === 'boolean' && typeof value !== 'boolean') args[key] = value === true || value === 'true'
-      else if (want === 'array' && !Array.isArray(value)) args[key] = [value]
+      args[key] = coerceValue(value, def)
+      if (Array.isArray(def.enum) && def.enum.length && !def.enum.includes(args[key])) {
+        const match = def.enum.find((v) => String(v).toLowerCase() === String(args[key]).toLowerCase())
+        if (match !== undefined) args[key] = match
+      }
     }
-    out.push({ name: call.name, arguments: JSON.stringify(args) })
+    out.push({ name, arguments: JSON.stringify(args) })
   }
   return out
 }
@@ -650,18 +743,39 @@ function buildTranscript(messages) {
   const systems = []
   const turns = []
   const nameById = new Map()
+  const list = messages || []
 
-  for (const msg of messages || []) {
+  // An identical tool result repeated later in the history is replaced by a note:
+  // the model already sees the newest copy, and the older one only costs prefill.
+  const duplicates = new Set()
+  if (cfg.contextDedupe.enabled !== false) {
+    const seen = new Map()
+    const minChars = cfg.contextDedupe.minChars || 1500
+    list.forEach((msg, i) => {
+      if (msg.role !== 'tool' || typeof msg.content !== 'string') return
+      if (msg.content.length < minChars) return
+      const prev = seen.get(msg.content)
+      if (prev !== undefined) duplicates.add(prev)
+      seen.set(msg.content, i)
+    })
+  }
+
+  list.forEach((msg, index) => {
     const role = msg.role
     if (role === 'system' || role === 'developer') {
       systems.push(contentToText(msg.content))
-      continue
+      return
     }
     if (role === 'tool') {
       const id = msg.tool_call_id || ''
       const name = nameById.get(id) || msg.name || 'tool'
+      if (duplicates.has(index)) {
+        stats.dedupedResults++
+        turns.push(`[tool result ${name}${id ? ` #${id}` : ''}]\n(same output as a later call, omitted)`)
+        return
+      }
       turns.push(`[tool result ${name}${id ? ` #${id}` : ''}]\n${contentToText(msg.content)}`)
-      continue
+      return
     }
     if (role === 'assistant') {
       const text = contentToText(msg.content)
@@ -672,10 +786,10 @@ function buildTranscript(messages) {
           .join('\n')
         turns.push(`[assistant]\n${text ? `${text}\n` : ''}${rendered}`)
       } else if (text) turns.push(`[assistant]\n${text}`)
-      continue
+      return
     }
     turns.push(`[${role || 'user'}]\n${contentToText(msg.content)}`)
-  }
+  })
 
   return { system: systems.filter(Boolean).join('\n\n'), context: turns.join('\n\n') }
 }
@@ -802,6 +916,40 @@ async function handleChat(req, res) {
   let hops = 0
   let usedCache = false
 
+  const id = newId()
+  const created = Math.floor(Date.now() / 1000)
+  const streamed = { chars: 0, active: false, decided: false }
+
+  // Parts of a long answer are forwarded as they arrive, so a model that needs
+  // three minutes does not look frozen. Tool calls are never streamed.
+  const onPart = (text) => {
+    if (!body.stream || !text) return
+    if (!streamed.decided) {
+      streamed.decided = true
+      const head = text.trimStart()
+      const looksLikeCall =
+        head.startsWith('{') ||
+        head.startsWith('```') ||
+        /^<(invoke|function_calls|antml)/.test(head) ||
+        /"tool_calls"\s*:/.test(head.slice(0, 200))
+      streamed.active = !looksLikeCall
+      if (streamed.active) {
+        sendSse(res, {
+          id, object: 'chat.completion.chunk', created, model,
+          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+        })
+      }
+    }
+    if (!streamed.active) return
+    for (let i = 0; i < text.length; i += 120) {
+      sendSse(res, {
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: { content: text.slice(i, i + 120) }, finish_reason: null }],
+      })
+    }
+    streamed.chars += text.length
+  }
+
   try {
     if (ckey) {
       const hit = cacheGet(ckey)
@@ -819,12 +967,13 @@ async function handleChat(req, res) {
         hops = hop
         let result
         try {
-          result = await simChatChunked({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
+          result = await simChatChunked({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal, onPart })
         } catch (err) {
           const status = err.status
           const retryable =
             status === 402 || status === 404 || status === 429 || status >= 500 || err.code === 'TIMEOUT'
           if (cfg.fallbackModel && cfg.fallbackModel !== model && retryable) {
+            stats.fallbacks++
             log(`fallback ${model} -> ${cfg.fallbackModel} (${short(err.message, 120)})`)
             model = cfg.fallbackModel
             result = await simChat({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
@@ -931,6 +1080,7 @@ async function handleChat(req, res) {
     }
     stats.errorsByCode = stats.errorsByCode || {}
     log(`chat ${model} FAILED in ${Date.now() - startedAll}ms: ${short(msg, 240)}`)
+    rememberError(msg)
     const status =
       err && err.code === 'TIMEOUT'
         ? 504
@@ -956,8 +1106,6 @@ async function handleChat(req, res) {
     completion_tokens: (tokens && tokens.output) || 0,
     total_tokens: (tokens && tokens.total) || 0,
   }
-  const id = newId()
-  const created = Math.floor(Date.now() / 1000)
   const clientCalls = calls ? calls : null
 
   stats.chatRequests++
@@ -995,10 +1143,18 @@ async function handleChat(req, res) {
   }
 
   if (body.stream) {
-    sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
     const text = content || ''
-    for (let i = 0; i < text.length; i += 48) {
-      sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: text.slice(i, i + 48) }, finish_reason: null }] })
+    if (!streamed.chars) {
+      sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
+      for (let i = 0; i < text.length; i += 48) {
+        sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: text.slice(i, i + 48) }, finish_reason: null }] })
+      }
+    } else {
+      // Everything up to streamed.chars already went out part by part.
+      const rest = text.slice(streamed.chars)
+      for (let i = 0; i < rest.length; i += 48) {
+        sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: rest.slice(i, i + 48) }, finish_reason: null }] })
+      }
     }
     sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage })
     res.write('data: [DONE]\n\n')
@@ -1013,6 +1169,25 @@ async function handleChat(req, res) {
 }
 
 // ------------------------------------------------------------------- server
+let creditsCache = { at: 0, data: null }
+
+async function fetchCredits(force = false) {
+  if (!force && creditsCache.data && Date.now() - creditsCache.at < 300000) return creditsCache.data
+  try {
+    const res = await fetch(`${SIM_API}/billing/status`, {
+      headers: { 'X-API-Key': cfg.simApiKey },
+      signal: AbortSignal.timeout(10000),
+    })
+    if (!res.ok) return creditsCache.data
+    const body = await res.json()
+    const d = (body && body.data) || {}
+    creditsCache = { at: Date.now(), data: { plan: d.plan, credits: d.credits, limits: d.limits } }
+    return creditsCache.data
+  } catch {
+    return creditsCache.data
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
   const p = url.pathname.replace(/\/+$/, '') || '/'
@@ -1029,7 +1204,13 @@ const server = http.createServer(async (req, res) => {
     })
   }
 
-  if (req.method === 'GET' && p === '/stats') return json(res, 200, stats)
+  if (req.method === 'GET' && p === '/stats') {
+    return json(res, 200, { ...stats, chunkSizes: Object.fromEntries(chunkSizes), credits: creditsCache.data || null })
+  }
+
+  if (req.method === 'GET' && p === '/credits') {
+    return json(res, 200, (await fetchCredits(url.searchParams.has('force'))) || { error: 'unavailable' })
+  }
 
   if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
     const list = url.searchParams.get('all') ? models.all : models.hosted
