@@ -1,20 +1,16 @@
-# Secrets and local state
+# local state
 config.json
 models.cache.json
 *.log
+start-hidden.vbs
 .autostart.ps1
 
-# Dependencies / tooling
+# deps
 node_modules/
 package-lock.json
 
-# OS / editors
+# os / editors
 .DS_Store
 Thumbs.db
-desktop.ini
 .vscode/
 .idea/
-
-# Scratch
-e2e/
-tmp/

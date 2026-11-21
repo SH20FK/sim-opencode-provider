@@ -313,20 +313,35 @@ function setAutostart(on) {
       return
     }
     const vbs = path.join(ROOT, 'start-hidden.vbs')
+    if (!fs.existsSync(vbs)) {
+      fs.writeFileSync(
+        vbs,
+        [
+          "' Auto-generated: starts the proxy without a console window.",
+          'Set fso = CreateObject("Scripting.FileSystemObject")',
+          'dir = fso.GetParentFolderName(WScript.ScriptFullName)',
+          'Set sh = CreateObject("WScript.Shell")',
+          'sh.CurrentDirectory = dir',
+          `sh.Run "cmd /c cd /d """ & dir & """ && node src\\server.mjs >> server.log 2>> server.err.log", 0, False`,
+          '',
+        ].join('\r\n'),
+      )
+    }
     const ps1 = path.join(ROOT, '.autostart.ps1')
     const esc = (s) => s.replace(/'/g, "''")
     fs.writeFileSync(
       ps1,
-      [
-        `$sh = New-Object -ComObject WScript.Shell`,
-        `$lnk = $sh.CreateShortcut('${esc(link)}')`,
-        `$lnk.TargetPath = 'wscript.exe'`,
-        `$lnk.Arguments = '"${esc(vbs)}"'`,
-        `$lnk.WorkingDirectory = '${esc(ROOT)}'`,
-        `$lnk.Description = 'Sim -> OpenAI proxy for OpenCode'`,
-        `$lnk.Save()`,
-        '',
-      ].join('\r\n'),
+      '\uFEFF' +
+        [
+          `$sh = New-Object -ComObject WScript.Shell`,
+          `$lnk = $sh.CreateShortcut('${esc(link)}')`,
+          `$lnk.TargetPath = 'wscript.exe'`,
+          `$lnk.Arguments = '"${esc(vbs)}"'`,
+          `$lnk.WorkingDirectory = '${esc(ROOT)}'`,
+          `$lnk.Description = 'Sim -> OpenAI proxy for OpenCode'`,
+          `$lnk.Save()`,
+          '',
+        ].join('\r\n'),
     )
     execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${ps1}"`, { stdio: 'ignore', windowsHide: true })
     if (fs.existsSync(ps1)) fs.unlinkSync(ps1)
