@@ -32,8 +32,10 @@ const DEFAULTS = {
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200 },
   proxyTools: { now: true, web_fetch: true, web_search: true },
   nudge: { enabled: true, maxRetries: 2 },
-  chunking: { enabled: true, maxParts: 12 },
-  contextDedupe: { enabled: true, minChars: 1500 },
+  chunking: { enabled: true, maxParts: 24 },
+  contextDedupe: { enabled: true, minChars: 1500, staleReads: true },
+  earlyHeadersMs: 90000,
+  localToken: '',
   maxProxyToolHops: 3,
 }
 
@@ -76,6 +78,21 @@ const log = (...args) => console.log(new Date().toISOString(), ...args)
 const short = (s, n = 300) => (typeof s === 'string' && s.length > n ? `${s.slice(0, n)}...(${s.length})` : s)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+// Exponential backoff with jitter, capped so a retry never stalls a request for long.
+function backoffMs(attempt, base = 600, cap = 15000) {
+  return Math.min(cap, Math.round(base * Math.pow(2.5, attempt) * (0.85 + Math.random() * 0.3)))
+}
+
+function retryAfterMs(res) {
+  const raw = res.headers.get('retry-after')
+  if (!raw) return null
+  const seconds = Number(raw)
+  if (!Number.isNaN(seconds)) return Math.min(30000, Math.max(0, seconds * 1000))
+  const at = Date.parse(raw)
+  if (!Number.isNaN(at)) return Math.min(30000, Math.max(0, at - Date.now()))
+  return null
+}
+
 // ------------------------------------------------------------------- stats
 const stats = {
   startedAt: new Date().toISOString(),
@@ -100,6 +117,14 @@ const stats = {
 function rememberError(message) {
   stats.lastErrors.unshift({ at: new Date().toISOString(), message: short(String(message), 300) })
   if (stats.lastErrors.length > 5) stats.lastErrors.length = 5
+}
+
+// Ring buffer of the last requests: what was sent, how long each part took, how
+// it ended. Read with GET /trace and shown by the panel.
+const traces = []
+function traceRequest(entry) {
+  traces.unshift(entry)
+  if (traces.length > 20) traces.length = 20
 }
 
 function bump(model, ms, tokensIn, tokensOut) {
@@ -293,6 +318,32 @@ const CONTINUE_MARK = '<<<CONTINUE>>>'
 // come back empty. So long answers are produced in parts and stitched together.
 const DEFAULT_CHUNK = { words: 250, lines: 100 }
 const chunkSizes = new Map()
+const CHUNK_STATE = path.join(ROOT, 'chunk.state.json')
+let chunkSaveTimer = null
+
+// Learned part sizes survive a restart, so a slow model does not have to hit the
+// 120 s wall once more just to rediscover its own safe size.
+function loadChunkSizes() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(CHUNK_STATE, 'utf8').replace(/^\uFEFF/, ''))
+    for (const [model, size] of Object.entries(raw)) {
+      const words = Number(size && size.words)
+      const lines = Number(size && size.lines)
+      if (words > 0) chunkSizes.set(model, { words, lines: lines > 0 ? lines : 60 })
+    }
+  } catch {}
+}
+
+function saveChunkSizes() {
+  if (chunkSaveTimer) return
+  chunkSaveTimer = setTimeout(() => {
+    chunkSaveTimer = null
+    try {
+      fs.writeFileSync(CHUNK_STATE, JSON.stringify(Object.fromEntries(chunkSizes), null, 2) + '\n')
+    } catch {}
+  }, 1000)
+  chunkSaveTimer.unref?.()
+}
 
 function chunkSize(model) {
   return chunkSizes.get(model) || { ...DEFAULT_CHUNK }
@@ -309,18 +360,26 @@ function chunkingInstruction(size) {
 }
 
 async function simChatChunked({ model, systemPrompt, context, temperature, maxTokens, signal, onPart }) {
-  if (!cfg.chunking.enabled) return simChat({ model, systemPrompt, context, temperature, maxTokens, signal })
+  if (!cfg.chunking.enabled) {
+    const t0 = Date.now()
+    const res = await simChat({ model, systemPrompt, context, temperature, maxTokens, signal })
+    if (onPart && res.content) onPart(res.content, 0)
+    return { ...res, chunks: 1, partsMs: [Date.now() - t0] }
+  }
 
   // A large client-side cap would only make Sim return an empty body when hit.
   const limit = typeof maxTokens === 'number' && maxTokens > 0 && maxTokens <= 2000 ? maxTokens : undefined
+  const maxParts = cfg.chunking.maxParts || 24
   const parts = []
+  const partsMs = []
   const tokens = { input: 0, output: 0, total: 0 }
   let ctx = context
   let cost = null
   let hint = ''
   let size = chunkSize(model)
+  let truncated = false
 
-  for (let i = 0; i < (cfg.chunking.maxParts || 12); i++) {
+  for (let i = 0; i < maxParts; i++) {
     const system = [systemPrompt, chunkingInstruction(size), hint].filter(Boolean).join('\n\n')
     const t0 = Date.now()
     let res
@@ -335,6 +394,7 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
           lines: Math.max(40, Math.round(size.lines * 0.6)),
         }
         chunkSizes.set(model, size)
+        saveChunkSizes()
         stats.chunkShrinks++
         log(`chunk ${i + 1} of ${model} timed out, shrinking to ${size.words} words / ${size.lines} lines`)
         hint =
@@ -346,6 +406,7 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
       throw err
     }
     const took = Date.now() - t0
+    partsMs.push(took)
 
     // Recover the budget slowly when parts finish with plenty of room.
     if (took < 25000 && (size.words < DEFAULT_CHUNK.words || size.lines < DEFAULT_CHUNK.lines)) {
@@ -354,6 +415,7 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
         lines: Math.min(DEFAULT_CHUNK.lines, Math.round(size.lines * 1.2)),
       }
       chunkSizes.set(model, size)
+      saveChunkSizes()
     }
 
     if (res.tokens) {
@@ -376,9 +438,14 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
     }
     parts.push(text)
     if (onPart) onPart(text, parts.length - 1)
-    return { content: parts.join(''), tokens, cost, chunks: parts.length }
+    return { content: parts.join(''), tokens, cost, chunks: parts.length, partsMs }
   }
-  return { content: parts.join(''), tokens, cost, chunks: parts.length }
+
+  // The loop ended because of the part limit, not because the model finished.
+  truncated = true
+  stats.chunkLimitHits = (stats.chunkLimitHits || 0) + 1
+  log(`chunk limit ${maxParts} reached for ${model}: the answer is truncated`)
+  return { content: parts.join(''), tokens, cost, chunks: parts.length, partsMs, truncated }
 }
 
 async function simChat({ model, systemPrompt, context, temperature, maxTokens, signal }) {
@@ -412,9 +479,11 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
       }
       if (!res.ok) {
         const msg = (data.error && (data.error.message || data.error.code)) || `HTTP ${res.status}`
+        const wait = res.status === 429 ? retryAfterMs(res) ?? backoffMs(attempt) : backoffMs(attempt)
         if ((res.status === 429 || res.status >= 500) && attempt < 2) {
           lastErr = new Error(`Sim ${res.status}: ${msg}`)
-          await sleep(700 * (attempt + 1))
+          log(`Sim ${res.status}, retrying in ${wait}ms`)
+          await sleep(wait)
           continue
         }
         const err = new Error(`Sim ${res.status}: ${msg}`)
@@ -453,7 +522,9 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
       if (err.name === 'AbortError') throw err
       lastErr = err
       if (/fetch failed|ECONNRESET|ETIMEDOUT|network/i.test(String(err.message)) && attempt < 2) {
-        await sleep(700 * (attempt + 1))
+        const wait = backoffMs(attempt)
+        log(`network error from Sim (${short(err.message, 80)}), retrying in ${wait}ms`)
+        await sleep(wait)
         continue
       }
       throw err
@@ -739,18 +810,48 @@ function contentToText(content) {
   return JSON.stringify(content)
 }
 
+// Resource key so a repeated read of the same file can be collapsed: only the
+// newest copy is authoritative, older ones are stale and only cost prefill.
+function staleKey(name, args) {
+  if (!args || typeof args !== 'object') return null
+  const norm = (v) => String(v).replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase()
+  const file = args.filePath || args.path
+  if (name === 'read' && file) return `read:${norm(file)}:${args.offset ?? ''}:${args.limit ?? ''}`
+  if (name === 'grep' && args.pattern) return `grep:${args.pattern}:${norm(args.path || '')}`
+  if (name === 'glob' && args.pattern) return `glob:${args.pattern}:${norm(args.path || '')}`
+  return null
+}
+
 function buildTranscript(messages) {
   const systems = []
   const turns = []
   const nameById = new Map()
+  const argsById = new Map()
   const list = messages || []
+
+  // Tool call id -> name/arguments, so tool results can be matched to their call.
+  for (const msg of list) {
+    if (msg.role !== 'assistant' || !Array.isArray(msg.tool_calls)) continue
+    for (const c of msg.tool_calls) {
+      if (!c.id) continue
+      nameById.set(c.id, (c.function || {}).name)
+      let parsed = null
+      try {
+        parsed = JSON.parse((c.function || {}).arguments || '{}')
+      } catch {}
+      if (parsed) argsById.set(c.id, parsed)
+    }
+  }
 
   // An identical tool result repeated later in the history is replaced by a note:
   // the model already sees the newest copy, and the older one only costs prefill.
   const duplicates = new Set()
+  const stale = new Set()
   if (cfg.contextDedupe.enabled !== false) {
     const seen = new Map()
     const minChars = cfg.contextDedupe.minChars || 1500
+    const latestByResource = new Map()
+    const staleMinChars = cfg.contextDedupe.staleMinChars || 500
     list.forEach((msg, i) => {
       if (msg.role !== 'tool' || typeof msg.content !== 'string') return
       if (msg.content.length < minChars) return
@@ -758,6 +859,18 @@ function buildTranscript(messages) {
       if (prev !== undefined) duplicates.add(prev)
       seen.set(msg.content, i)
     })
+    if (cfg.contextDedupe.staleReads !== false) {
+      list.forEach((msg, i) => {
+        if (msg.role !== 'tool' || typeof msg.content !== 'string') return
+        if (msg.content.length < staleMinChars) return
+        const name = nameById.get(msg.tool_call_id) || msg.name
+        const key = staleKey(name, argsById.get(msg.tool_call_id))
+        if (!key) return
+        const prev = latestByResource.get(key)
+        if (prev !== undefined) stale.add(prev)
+        latestByResource.set(key, i)
+      })
+    }
   }
 
   list.forEach((msg, index) => {
@@ -774,13 +887,17 @@ function buildTranscript(messages) {
         turns.push(`[tool result ${name}${id ? ` #${id}` : ''}]\n(same output as a later call, omitted)`)
         return
       }
+      if (stale.has(index)) {
+        stats.staleResults = (stats.staleResults || 0) + 1
+        turns.push(`[tool result ${name}${id ? ` #${id}` : ''}]\n(stale: this file was read again later, see the newest result)`)
+        return
+      }
       turns.push(`[tool result ${name}${id ? ` #${id}` : ''}]\n${contentToText(msg.content)}`)
       return
     }
     if (role === 'assistant') {
       const text = contentToText(msg.content)
       if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
-        for (const c of msg.tool_calls) if (c.id) nameById.set(c.id, (c.function || {}).name)
         const rendered = msg.tool_calls
           .map((c) => `[tool call ${(c.function || {}).name} #${c.id || ''}]\n${(c.function || {}).arguments || '{}'}`)
           .join('\n')
@@ -893,6 +1010,33 @@ async function handleChat(req, res) {
   const cacheable = cfg.cache.enabled && !emulation && (temperature === undefined || temperature === 0)
   const ckey = cacheable ? cacheKey([requestedModel, systemPrompt, transcript].join('\u0000')) : null
 
+  const rid = `sim-${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-4)}`
+  res.setHeader('X-Request-Id', rid)
+  // Where the input tokens actually go: system prompt, our tool block, history.
+  const inChars = {
+    system: system.length,
+    tools: toolBlock.length + (emulation ? Math.max(0, systemPrompt.length - system.length) : 0),
+    context: transcript.length,
+  }
+
+  // Node's fetch and other non-streaming clients give up when headers take
+  // minutes. After earlyHeadersMs we answer 200 and flush the body when ready.
+  const early = { sent: false, timer: null }
+  const earlyMs = Number(cfg.earlyHeadersMs || 0)
+  if (!body.stream && earlyMs > 0) {
+    early.timer = setTimeout(() => {
+      if (res.headersSent || res.writableEnded) return
+      early.sent = true
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+      })
+      res.flushHeaders?.()
+    }, earlyMs)
+    early.timer.unref?.()
+  }
+
   // Open the stream before the long await so the client never sees an idle socket.
   let pingTimer = null
   if (body.stream) {
@@ -905,6 +1049,15 @@ async function handleChat(req, res) {
   const cleanup = () => {
     if (pingTimer) clearInterval(pingTimer)
     pingTimer = null
+    if (early.timer) clearTimeout(early.timer)
+    early.timer = null
+  }
+  const respond = (payload) => {
+    if (early.sent) {
+      if (!res.writableEnded) res.end(JSON.stringify(payload))
+      return
+    }
+    return json(res, 200, payload)
   }
   const controller = new AbortController()
   res.on('close', () => controller.abort())
@@ -915,6 +1068,9 @@ async function handleChat(req, res) {
   let calls = null
   let hops = 0
   let usedCache = false
+  let usedFallback = null
+  let truncated = false
+  const partsMs = []
 
   const id = newId()
   const created = Math.floor(Date.now() / 1000)
@@ -974,6 +1130,7 @@ async function handleChat(req, res) {
             status === 402 || status === 404 || status === 429 || status >= 500 || err.code === 'TIMEOUT'
           if (cfg.fallbackModel && cfg.fallbackModel !== model && retryable) {
             stats.fallbacks++
+            usedFallback = cfg.fallbackModel
             log(`fallback ${model} -> ${cfg.fallbackModel} (${short(err.message, 120)})`)
             model = cfg.fallbackModel
             result = await simChat({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
@@ -989,6 +1146,8 @@ async function handleChat(req, res) {
 
         content = result.content
         tokens = result.tokens
+        if (Array.isArray(result.partsMs)) partsMs.push(...result.partsMs)
+        if (result.truncated) truncated = true
         bump(model, Date.now() - startedAll, (tokens && tokens.input) || 0, (tokens && tokens.output) || 0)
 
         calls = null
@@ -1091,10 +1250,19 @@ async function handleChat(req, res) {
             : /402|credit/i.test(msg)
               ? 402
               : 502
-    if (res.headersSent) {
+    if (body.stream && res.headersSent) {
       sendSse(res, { error: { message: msg, type: 'upstream_error' } })
       res.write('data: [DONE]\n\n')
       return res.end()
+    }
+    traceRequest({
+      id: rid, at: new Date().toISOString(), model, inChars, tools: tools.length,
+      chunks: partsMs.length, partsMs, totalMs: Date.now() - startedAll,
+      outcome: 'error', error: short(msg, 200),
+    })
+    if (early.sent) {
+      if (!res.writableEnded) res.end(JSON.stringify({ error: { message: msg, type: 'upstream_error', code: status } }))
+      return
     }
     return openaiError(res, status, msg, 'upstream_error')
   }
@@ -1120,6 +1288,15 @@ async function handleChat(req, res) {
 
   if (ckey && !usedCache && content) cacheSet(ckey, content)
 
+  traceRequest({
+    id: rid, at: new Date().toISOString(), model, inChars, tools: tools.length,
+    chunks: partsMs.length, partsMs, totalMs: ms,
+    outcome: truncated ? 'truncated' : 'ok',
+    fallback: usedFallback || undefined,
+    toolCalls: clientCalls ? clientCalls.length : 0,
+    cache: usedCache || undefined,
+  })
+
   if (clientCalls) {
     const toolCalls = clientCalls.map((c) => ({ id: newCallId(), type: 'function', function: { name: c.name, arguments: c.arguments } }))
     if (body.stream) {
@@ -1135,7 +1312,7 @@ async function handleChat(req, res) {
       res.write('data: [DONE]\n\n')
       return res.end()
     }
-    return json(res, 200, {
+    return respond({
       id, object: 'chat.completion', created, model,
       choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: toolCalls }, finish_reason: 'tool_calls' }],
       usage,
@@ -1161,7 +1338,7 @@ async function handleChat(req, res) {
     return res.end()
   }
 
-  return json(res, 200, {
+  return respond({
     id, object: 'chat.completion', created, model,
     choices: [{ index: 0, message: { role: 'assistant', content: content || '' }, finish_reason: 'stop' }],
     usage,
@@ -1192,6 +1369,15 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
   const p = url.pathname.replace(/\/+$/, '') || '/'
 
+  // Optional local token: keeps other apps on the machine from using the proxy.
+  if (cfg.localToken) {
+    const auth = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '')
+    const key = String(req.headers['x-api-key'] || '')
+    if (auth !== cfg.localToken && key !== cfg.localToken) {
+      return openaiError(res, 401, 'invalid local token — reinstall the provider or check config.json', 'authentication_error')
+    }
+  }
+
   if (req.method === 'GET' && (p === '/' || p === '/health')) {
     return json(res, 200, {
       ok: true,
@@ -1202,6 +1388,11 @@ const server = http.createServer(async (req, res) => {
       cache: cfg.cache.enabled,
       maxConcurrent: cfg.maxConcurrent,
     })
+  }
+
+  if (req.method === 'GET' && p === '/trace') {
+    const limit = Math.min(20, Number(url.searchParams.get('limit')) || 20)
+    return json(res, 200, { traces: traces.slice(0, limit) })
   }
 
   if (req.method === 'GET' && p === '/stats') {
@@ -1235,6 +1426,7 @@ const server = http.createServer(async (req, res) => {
 })
 
 readModelsCache()
+loadChunkSizes()
 await refreshModels()
 
 server.on('error', (err) => {

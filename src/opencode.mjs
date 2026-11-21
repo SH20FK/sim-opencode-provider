@@ -57,7 +57,7 @@ function backup(file) {
   return target
 }
 
-export function buildProvider(baseURL, ids) {
+export function buildProvider(baseURL, ids, apiKey) {
   const known = new Map(MODELS.map((m) => [m.id, m]))
   const list = ids && ids.length ? ids : MODELS.map((m) => m.id)
   const models = {}
@@ -72,7 +72,7 @@ export function buildProvider(baseURL, ids) {
   return {
     npm: '@ai-sdk/openai-compatible',
     name: 'Sim (free)',
-    options: { baseURL, apiKey: 'sim-local' },
+    options: { baseURL, apiKey: apiKey || 'sim-local' },
     models,
   }
 }
@@ -119,7 +119,7 @@ export function install(baseURL, opts = {}, file = configPath()) {
   const cfg = readConfig(file)
   const saved = backup(file)
   cfg.provider = cfg.provider || {}
-  cfg.provider[PROVIDER_ID] = buildProvider(baseURL, opts.hosted)
+  cfg.provider[PROVIDER_ID] = buildProvider(baseURL, opts.hosted, opts.apiKey)
   fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n')
   return { path: file, backup: saved, models: Object.keys(cfg.provider[PROVIDER_ID].models).length }
 }

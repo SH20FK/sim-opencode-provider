@@ -1,6 +1,8 @@
 # local state
 config.json
 models.cache.json
+chunk.state.json
+bench.json
 *.log
 start-hidden.vbs
 .autostart.ps1

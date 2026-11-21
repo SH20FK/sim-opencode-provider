@@ -25,10 +25,13 @@
   "maxProxyToolHops": 3,
   "chunking": {
     "enabled": true,
-    "maxParts": 12
+    "maxParts": 24
   },
   "contextDedupe": {
     "enabled": true,
-    "minChars": 1500
-  }
+    "minChars": 1500,
+    "staleReads": true
+  },
+  "localToken": "",
+  "earlyHeadersMs": 90000
 }

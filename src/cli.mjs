@@ -9,12 +9,14 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import net from 'node:net'
 import { spawn, execSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import readline from 'node:readline'
 import { stdin as input, stdout as output } from 'node:process'
 import * as opencode from './opencode.mjs'
+import { runBench, writeTable, defaultDesktopPath } from './bench.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
@@ -150,7 +152,13 @@ async function api(pathname, key, init = {}) {
 }
 
 async function proxyFetch(cfg, pathname, init = {}) {
-  const res = await fetch(`http://127.0.0.1:${cfg.port}${pathname}`, { ...init, signal: AbortSignal.timeout(120000) })
+  const headers = { ...(init.headers || {}) }
+  if (cfg.localToken) headers.Authorization = `Bearer ${cfg.localToken}`
+  const res = await fetch(`http://127.0.0.1:${cfg.port}${pathname}`, {
+    ...init,
+    headers,
+    signal: AbortSignal.timeout(120000),
+  })
   const text = await res.text()
   let body
   try {
@@ -413,6 +421,23 @@ async function showStatus(cfg) {
   for (const [name, m] of top) info(`    ${name}: ${m.calls} выз., ${Math.round(m.latencyMs / m.calls)} мс`)
   const sizes = Object.entries(st.chunkSizes || {})
   if (sizes.length) info(`    части: ${sizes.map(([m, s]) => `${m} → ${s.words} слов`).join(', ')}`)
+  const tr = (await proxyFetch(cfg, '/trace?limit=3')).body || {}
+  const last = (tr.traces || [])[0]
+  if (last) {
+    const parts = (last.partsMs || []).map((ms) => `${Math.round(ms / 1000)}с`).join(' · ')
+    info(
+      `  последний запрос: ${last.model} · ${Math.round((last.totalMs || 0) / 1000)} с · ${last.chunks || 0} част.` +
+        (parts ? ` (${parts})` : ''),
+    )
+    if (last.inChars) {
+      info(
+        `    вход: system ${Math.round(last.inChars.system / 1000)}k / tools ${Math.round(last.inChars.tools / 1000)}k` +
+          ` / ctx ${Math.round(last.inChars.context / 1000)}k символов`,
+      )
+    }
+    if (last.outcome && last.outcome !== 'ok') info(`    итог: ${last.outcome}${last.error ? ` — ${last.error}` : ''}`)
+  }
+  if (cfg.localToken) info('  локальный токен: включён')
   if (Array.isArray(st.lastErrors) && st.lastErrors.length) {
     info('  последние ошибки:')
     for (const e of st.lastErrors.slice(0, 3)) info(`    ${String(e.at).slice(11, 19)}  ${e.message}`)
@@ -437,6 +462,61 @@ async function quickTest(cfg) {
   if (r.status !== 200) return bad(`${r.status}: ${r.body.error ? r.body.error.message : JSON.stringify(r.body)}`)
   ok(`${ms} мс · ${r.body.usage.total_tokens} токенов`)
   console.log(paint('gray', `  → ${String(r.body.choices[0].message.content).slice(0, 220)}`))
+}
+
+async function runBenchCommand(cfg, args = []) {
+  if (!(await alive(cfg))) {
+    bad('Сначала запусти прокси')
+    return
+  }
+  const all = args.includes('--all')
+  const modelsArg = (args.find((a) => a.startsWith('--models=')) || '').slice('--models='.length)
+  const limitArg = Number((args.find((a) => a.startsWith('--limit=')) || '').slice('--limit='.length)) || 0
+
+  let models = modelsArg
+    ? modelsArg.split(',').map((s) => s.trim()).filter(Boolean)
+    : all
+      ? ((await proxyFetch(cfg, '/v1/models?all=1')).body.data || []).map((m) => m.id)
+      : opencode.MODELS.map((m) => m.id)
+  if (limitArg) models = models.slice(0, limitArg)
+
+  if (!models.length) {
+    bad('Нет моделей для замера')
+    return
+  }
+
+  console.log(paint('bold', `\n  Замер ${models.length} моделей`))
+  info('  скорость — напрямую в Sim, тул и JSON — через прокси. Две модели параллельно.\n')
+  const t0 = Date.now()
+  const rows = await runBench(
+    {
+      simApiKey: cfg.simApiKey,
+      workspaceId: cfg.workspaceId,
+      proxyUrl: `http://127.0.0.1:${cfg.port}`,
+      token: cfg.localToken,
+      models,
+      concurrency: 2,
+    },
+    (done, total, row) => {
+      const speed = row.speed ? `${row.speed.tokPerSec} tok/s` : row.error || '—'
+      const tool = row.tool ? (row.tool.name === 'read' && row.tool.argsOk ? 'тул ok' : 'тул нет') : '—'
+      const json = row.json ? (row.json.ok ? 'json ok' : 'json нет') : '—'
+      console.log(`  [${done}/${total}] ${row.model.padEnd(28)} ${speed.padEnd(12)} ${tool}, ${json}`)
+    },
+  )
+
+  const out = defaultDesktopPath()
+  try {
+    writeTable(rows, out)
+    ok(`таблица: ${out}`)
+  } catch (err) {
+    bad(`Не смог записать таблицу: ${err.message}`)
+  }
+  try {
+    fs.writeFileSync(path.join(ROOT, 'bench.json'), JSON.stringify(rows, null, 2) + '\n')
+    info('  сырые данные: bench.json')
+  } catch {}
+  ok(`готово за ${Math.round((Date.now() - t0) / 60000)} мин`)
 }
 
 function tailLog(n = 25) {
@@ -492,8 +572,8 @@ ${paint('gray', `     "sim": {
   4. Введи ${paint('cyan', '/models')} и выбери ${paint('bold', 'Sim (free)')} → нужную модель.
 
   Важно:
-  · "apiKey": "sim-local" — заглушка, OpenCode требует поле. Настоящий ключ
-    Sim лежит в config.json прокси и в OpenCode не попадает.
+  · "apiKey" — локальный токен прокси, он лежит в config.json. Настоящий ключ
+    Sim в OpenCode не попадает.
   · Прокси должен быть запущен, иначе модели ответят connection refused.
   · Порт поменял — поменяй и baseURL.
   · Проверить: ${paint('cyan', `curl ${baseURL(cfg)}/models`)}
@@ -501,8 +581,13 @@ ${paint('gray', `     "sim": {
 }
 
 async function installProvider(cfg) {
+  if (!cfg.localToken) {
+    cfg.localToken = crypto.randomBytes(16).toString('hex')
+    saveConfig(cfg)
+    info('  локальный токен создан и сохранён в config.json')
+  }
   const hosted = await opencode.fetchHosted(cfg)
-  const res = opencode.install(baseURL(cfg), { hosted })
+  const res = opencode.install(baseURL(cfg), { hosted, apiKey: cfg.localToken })
   return { ...res, hosted: Boolean(hosted) }
 }
 
@@ -619,6 +704,7 @@ async function menu(cfg) {
   ${paint('bold', '5')}  Тест запроса
   ${paint('bold', '6')}  Настройки
   ${paint('bold', '7')}  Логи
+  ${paint('bold', '8')}  Бенчмарк моделей → таблица на рабочий стол
   ${paint('bold', 'Q')}  Выход`)
     const choice = (await ask('\n  Выбор', 'Q')).toLowerCase()
 
@@ -639,6 +725,9 @@ async function menu(cfg) {
     } else if (choice === '6') cfg = await settingsMenu(cfg)
     else if (choice === '7') {
       tailLog()
+      await ask('\n  Enter — продолжить')
+    } else if (choice === '8') {
+      await runBenchCommand(cfg, [])
       await ask('\n  Enter — продолжить')
     } else if (choice === 'q' || choice === '0') return
   }
@@ -676,6 +765,7 @@ else if (cmd === 'restart') {
 } else if (cmd === 'test') await quickTest(cfg)
 else if (cmd === 'logs') tailLog(Number(arg) || 25)
 else if (cmd === 'models') listModels()
+else if (cmd === 'bench') await runBenchCommand(cfg, process.argv.slice(3))
 else if (cmd === 'opencode-install') {
   const r = await installProvider(cfg)
   ok(`Провайдер установлен: ${r.models} моделей → ${r.path}`)
@@ -697,7 +787,7 @@ else if (!cmd) {
   await menu(cfg)
 } else {
   console.log(
-    'Использование: node src/cli.mjs [setup|start|stop|restart|status|test|logs|models|opencode-install|opencode-remove|opencode-status|autostart-on|autostart-off]',
+    'Использование: node src/cli.mjs [setup|start|stop|restart|status|test|logs|models|bench|opencode-install|opencode-remove|opencode-status|autostart-on|autostart-off]',
   )
 }
 
