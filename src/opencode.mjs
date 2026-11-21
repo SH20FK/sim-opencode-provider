@@ -31,6 +31,13 @@ export const MODELS = [
   { id: 'glm-5.3', name: 'GLM 5.3 (Sim)', context: 200000, output: 32768 },
   { id: 'glm-5.3-flash', name: 'GLM 5.3 Flash (Sim)', context: 128000, output: 16384 },
   { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro (Sim)', context: 128000, output: 32768 },
+  { id: 'claude-fable-5-2', name: 'Claude Fable 5.2 (Sim)', context: 200000, output: 32000 },
+  { id: 'claude-fable-5-1', name: 'Claude Fable 5.1 (Sim)', context: 200000, output: 32000 },
+  { id: 'claude-fable-5', name: 'Claude Fable 5 (Sim)', context: 200000, output: 32000 },
+  { id: 'gpt-6-astra', name: 'GPT 6 Astra (Sim)', context: 400000, output: 128000 },
+  { id: 'gpt-6.1-terra', name: 'GPT 6.1 Terra (Sim)', context: 400000, output: 128000 },
+  { id: 'gpt-6-luna', name: 'GPT 6 Luna (Sim)', context: 400000, output: 128000 },
+  { id: 'o3-pro', name: 'o3-pro (Sim, дорогая)', context: 200000, output: 100000 },
 ]
 
 export function configPath() {
