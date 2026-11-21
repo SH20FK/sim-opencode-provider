@@ -5,18 +5,18 @@
 //   node src/cli.mjs bench --everything # the whole catalogue (BYOK models included, mostly useless)
 //   node src/cli.mjs bench --models=a,b,c
 //
+// Every probe goes through the proxy, so the shared rate limiter keeps the run
+// under Sim's 60 requests per minute instead of collecting 429s.
+//
 // The speed probe talks to Sim directly (so it also gets the per-model price),
 // the tool probe goes through the proxy so it exercises the real pipeline.
 
 import fs from 'node:fs'
 
-const SIM = 'https://www.sim.ai/api/v2'
-
 const SPEED_PROMPT = 'Напиши связный текст примерно на 150 слов про море, маяки и корабли. Без заголовков и списков.'
 const JSON_PROMPT =
   'Ответь только JSON-объектом с полями ok (логическое true) и n (число 2). Без пояснений, без markdown, без текста вокруг.'
 const TOOL_PROMPT = 'Прочитай файл package.json и скажи, какая там версия. Сначала вызови инструмент read.'
-
 const TOOLS = [
   {
     type: 'function',
@@ -28,34 +28,8 @@ const TOOLS = [
   },
 ]
 
-async function simCall({ simApiKey, workspaceId, model, context, timeoutMs = 200000 }) {
-  const t0 = Date.now()
-  const res = await fetch(`${SIM}/tools/llm_chat/execute`, {
-    method: 'POST',
-    headers: { 'X-API-Key': simApiKey, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ workspaceId, input: { model, context } }),
-    signal: AbortSignal.timeout(timeoutMs),
-  })
-  const text = await res.text()
-  let data = {}
-  try {
-    data = JSON.parse(text)
-  } catch {}
-  const d = data.data || {}
-  const out = d.output || {}
-  return {
-    ms: Date.now() - t0,
-    status: res.status,
-    ok: d.status === 'succeeded',
-    error: (data.error && data.error.message) || (d.error && d.error.message) || null,
-    content: typeof out.content === 'string' ? out.content : '',
-    tokens: out.tokens || null,
-    pricing: (out.cost && out.cost.pricing) || null,
-  }
-}
-
 async function proxyCall({ proxyUrl, token, body, timeoutMs = 240000 }) {
-  const headers = { 'Content-Type': 'application/json' }
+  const headers = { 'Content-Type': 'application/json', 'X-Sim-No-Cache': '1' }
   if (token) headers.Authorization = `Bearer ${token}`
   const t0 = Date.now()
   const res = await fetch(`${proxyUrl}/v1/chat/completions`, {
@@ -89,13 +63,17 @@ async function benchOne(model, ctx) {
   const row = { model, speed: null, tool: null, json: null, error: null }
 
   try {
-    const speed = await simCall({ ...ctx, model, context: SPEED_PROMPT })
-    if (!speed.ok) {
-      row.error = speed.error || `HTTP ${speed.status}`
+    // Speed goes through the proxy too, so the shared rate limiter sees it.
+    const speed = await proxyCall({ ...ctx, body: { model, messages: [{ role: 'user', content: SPEED_PROMPT }] } })
+    const data = speed.data || {}
+    const content =
+      (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || ''
+    if (speed.status !== 200 || !content) {
+      row.error = (data.error && data.error.message) || `HTTP ${speed.status}`
       return row
     }
-    const outTokens = (speed.tokens && speed.tokens.output) || 0
-    const chars = speed.content.length
+    const outTokens = (data.usage && data.usage.completion_tokens) || 0
+    const chars = content.length
     const seconds = speed.ms / 1000
     row.speed = {
       seconds: Math.round(seconds * 10) / 10,
@@ -105,7 +83,7 @@ async function benchOne(model, ctx) {
       reasoningPct:
         outTokens > 0 ? Math.max(0, Math.round((1 - chars / 4 / outTokens) * 100)) : null,
     }
-    row.price = speed.pricing ? { input: speed.pricing.input, output: speed.pricing.output } : null
+    row.price = data.cost && data.cost.pricing ? { input: data.cost.pricing.input, output: data.cost.pricing.output } : null
   } catch (err) {
     row.error = String(err.message || err).slice(0, 120)
     return row

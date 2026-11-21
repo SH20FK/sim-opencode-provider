@@ -12,6 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { createRateLimiter } from './ratelimit.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
@@ -78,19 +79,13 @@ const log = (...args) => console.log(new Date().toISOString(), ...args)
 const short = (s, n = 300) => (typeof s === 'string' && s.length > n ? `${s.slice(0, n)}...(${s.length})` : s)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+// Sim allows 60 calls per minute per workspace (x-ratelimit-limit). Shared by every
+// call to llm_chat, so chunked parts and parallel requests stay under it.
+const limiter = createRateLimiter(log)
+
 // Exponential backoff with jitter, capped so a retry never stalls a request for long.
 function backoffMs(attempt, base = 600, cap = 15000) {
   return Math.min(cap, Math.round(base * Math.pow(2.5, attempt) * (0.85 + Math.random() * 0.3)))
-}
-
-function retryAfterMs(res) {
-  const raw = res.headers.get('retry-after')
-  if (!raw) return null
-  const seconds = Number(raw)
-  if (!Number.isNaN(seconds)) return Math.min(30000, Math.max(0, seconds * 1000))
-  const at = Date.parse(raw)
-  if (!Number.isNaN(at)) return Math.min(30000, Math.max(0, at - Date.now()))
-  return null
 }
 
 // ------------------------------------------------------------------- stats
@@ -468,6 +463,7 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
 
     await gate.acquire()
     try {
+      await limiter.before()
       const timeout = AbortSignal.timeout(cfg.requestTimeoutMs || 290000)
       const composed = signal && AbortSignal.any ? AbortSignal.any([timeout, signal]) : timeout
       const res = await fetch(`${SIM_API}/tools/llm_chat/execute`, {
@@ -483,11 +479,18 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
       } catch {
         throw new Error(`Sim returned non-JSON (HTTP ${res.status}): ${short(text, 160)}`)
       }
+      limiter.note(res, data)
       if (!res.ok) {
         const msg = (data.error && (data.error.message || data.error.code)) || `HTTP ${res.status}`
-        const wait = res.status === 429 ? retryAfterMs(res) ?? backoffMs(attempt) : backoffMs(attempt)
-        if ((res.status === 429 || res.status >= 500) && attempt < 2) {
+        if (res.status === 429 && attempt < 2) {
+          lastErr = new Error(`Sim 429: ${msg}`)
+          stats.rateLimited = (stats.rateLimited || 0) + 1
+          await limiter.waitForReset()
+          continue
+        }
+        if (res.status >= 500 && attempt < 2) {
           lastErr = new Error(`Sim ${res.status}: ${msg}`)
+          const wait = backoffMs(attempt)
           log(`Sim ${res.status}, retrying in ${wait}ms`)
           await sleep(wait)
           continue
@@ -1020,7 +1023,8 @@ async function handleChat(req, res) {
     typeof body.temperature === 'number' ? body.temperature : emulation ? cfg.toolTemperature : undefined
   const maxTokens = body.max_tokens || body.maxTokens
 
-  const cacheable = cfg.cache.enabled && !emulation && (temperature === undefined || temperature === 0)
+  const cacheable =
+    cfg.cache.enabled && !emulation && (temperature === undefined || temperature === 0) && req.headers['x-sim-no-cache'] !== '1'
   const ckey = cacheable ? cacheKey([requestedModel, systemPrompt, transcript].join('\u0000')) : null
 
   const rid = `sim-${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-4)}`
@@ -1078,6 +1082,7 @@ async function handleChat(req, res) {
   let model = requestedModel
   let content = ''
   let tokens = null
+  let cost = null
   let calls = null
   let hops = 0
   let usedCache = false
@@ -1161,6 +1166,7 @@ async function handleChat(req, res) {
 
         content = result.content
         tokens = result.tokens
+        if (result.cost) cost = result.cost
         if (Array.isArray(result.partsMs)) partsMs.push(...result.partsMs)
         if (result.truncated) truncated = true
         bump(model, Date.now() - startedAll, (tokens && tokens.input) || 0, (tokens && tokens.output) || 0)
@@ -1336,6 +1342,7 @@ async function handleChat(req, res) {
       id, object: 'chat.completion', created, model,
       choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: toolCalls }, finish_reason: 'tool_calls' }],
       usage,
+      cost,
     })
   }
 
@@ -1362,6 +1369,7 @@ async function handleChat(req, res) {
     id, object: 'chat.completion', created, model,
     choices: [{ index: 0, message: { role: 'assistant', content: content || '' }, finish_reason: 'stop' }],
     usage,
+    cost,
   })
 }
 
@@ -1416,7 +1424,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && p === '/stats') {
-    return json(res, 200, { ...stats, chunkSizes: Object.fromEntries(chunkSizes), credits: creditsCache.data || null })
+    return json(res, 200, {
+      ...stats,
+      chunkSizes: Object.fromEntries(chunkSizes),
+      credits: creditsCache.data || null,
+      rateLimit: limiter.state(),
+    })
   }
 
   if (req.method === 'GET' && p === '/credits') {

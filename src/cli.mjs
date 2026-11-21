@@ -497,7 +497,7 @@ async function runBenchCommand(cfg, args = []) {
 
   console.log(paint('bold', `\n  Замер ${models.length} моделей`))
   info(
-    `  скорость — напрямую в Sim, тул и JSON — через прокси. ` +
+    `  всё через прокси, с учётом лимита Sim (60 запросов/мин). ` +
       (concurrency > 0 ? `По ${concurrency} моделей параллельно.` : 'Без ограничения параллельности.') +
       '\n',
   )
