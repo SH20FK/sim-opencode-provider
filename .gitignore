@@ -1,5 +1,7 @@
 # local state
 config.json
+git.env
+*.env
 models.cache.json
 cache.json
 chunk.state.json
