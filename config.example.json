@@ -17,6 +17,11 @@
     "maxBytes": 8388608,
     "ttlByModel": {}
   },
+  "streamPacing": {
+    "enabled": true,
+    "chunkChars": 48,
+    "delayMs": 25
+  },
   "proxyTools": {
     "now": true,
     "web_fetch": true

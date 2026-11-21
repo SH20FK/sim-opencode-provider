@@ -33,6 +33,7 @@ const DEFAULTS = {
   simTimeoutSec: 300,
   fallbackModel: '',
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
+  streamPacing: { enabled: true, chunkChars: 48, delayMs: 25 },
   proxyTools: { now: true, web_fetch: true },
   nudge: { enabled: true, maxRetries: 2 },
   chunking: { enabled: true, maxParts: 24 },
@@ -60,6 +61,7 @@ function loadConfig() {
     ...DEFAULTS,
     ...raw,
     cache: { ...DEFAULTS.cache, ...(raw.cache || {}) },
+    streamPacing: { ...DEFAULTS.streamPacing, ...(raw.streamPacing || {}) },
     proxyTools: { ...DEFAULTS.proxyTools, ...(raw.proxyTools || {}) },
     nudge: { ...DEFAULTS.nudge, ...(raw.nudge || {}) },
     chunking: { ...DEFAULTS.chunking, ...(raw.chunking || {}) },
@@ -350,7 +352,7 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
   if (!cfg.chunking.enabled) {
     const t0 = Date.now()
     const res = await simChat({ model, systemPrompt, context, temperature, maxTokens, signal })
-    if (onPart && res.content) onPart(res.content, 0)
+    if (onPart && res.content) await onPart(res.content, 0)
     return { ...res, chunks: 1, partsMs: [Date.now() - t0] }
   }
 
@@ -416,7 +418,7 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
       text = text.split(CONTINUE_MARK).join('')
       parts.push(text)
       stats.chunks++
-      if (onPart) onPart(text, parts.length - 1)
+      if (onPart) await onPart(text, parts.length - 1)
       ctx =
         `${context}\n\n[assistant]\n${parts.join('')}\n\n[user]\n` +
         `Continue exactly where you stopped. Do not repeat anything and do not add commentary. ` +
@@ -424,7 +426,7 @@ async function simChatChunked({ model, systemPrompt, context, temperature, maxTo
       continue
     }
     parts.push(text)
-    if (onPart) onPart(text, parts.length - 1)
+    if (onPart) await onPart(text, parts.length - 1)
     return { content: parts.join(''), tokens, cost, chunks: parts.length, partsMs }
   }
 
@@ -1275,9 +1277,26 @@ async function handleChat(req, res) {
   const created = Math.floor(Date.now() / 1000)
   const streamed = { chars: 0, active: false, decided: false }
 
+  // Sim returns a part whole, so without pacing the client gets one wall of
+  // text per call. Sending it in small slices makes it read like typing.
+  const paceChars = Math.max(8, Number((cfg.streamPacing && cfg.streamPacing.chunkChars) || 48))
+  const paceDelay = Math.max(0, Number((cfg.streamPacing && cfg.streamPacing.delayMs) || 0))
+  const pacing = cfg.streamPacing ? cfg.streamPacing.enabled !== false : true
+
+  const sendContent = async (text) => {
+    for (let i = 0; i < text.length; i += paceChars) {
+      if (res.writableEnded || res.destroyed || controller.signal.aborted) return
+      sendSse(res, {
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: { content: text.slice(i, i + paceChars) }, finish_reason: null }],
+      })
+      if (pacing && paceDelay > 0 && i + paceChars < text.length) await sleep(paceDelay)
+    }
+  }
+
   // Parts of a long answer are forwarded as they arrive, so a model that needs
   // three minutes does not look frozen. Tool calls are never streamed.
-  const onPart = (text) => {
+  const onPart = async (text) => {
     if (!body.stream || !text) return
     if (!streamed.decided) {
       streamed.decided = true
@@ -1296,12 +1315,7 @@ async function handleChat(req, res) {
       }
     }
     if (!streamed.active) return
-    for (let i = 0; i < text.length; i += 120) {
-      sendSse(res, {
-        id, object: 'chat.completion.chunk', created, model,
-        choices: [{ index: 0, delta: { content: text.slice(i, i + 120) }, finish_reason: null }],
-      })
-    }
+    await sendContent(text)
     streamed.chars += text.length
   }
 
@@ -1498,7 +1512,7 @@ async function handleChat(req, res) {
     traceRequest({
       id: rid, at: new Date().toISOString(), model, inChars, tools: tools.length,
       chunks: partsMs.length, partsMs, totalMs: Date.now() - startedAll,
-      outcome: 'error', error: short(msg, 200),
+      outcome: 'error', error: short(msg, 200), stream: Boolean(body.stream),
     })
     if (early.sent) {
       if (!res.writableEnded) res.end(JSON.stringify({ error: { message: msg, type: 'upstream_error', code: status } }))
@@ -1526,6 +1540,7 @@ async function handleChat(req, res) {
   const ms = Date.now() - startedAll
   log(
     `chat ${model} ok in ${ms}ms${usedCache ? ' (cache)' : ''} · tools=${clientTools.length}+${proxyTools.length}` +
+      ` · stream=${body.stream ? `on/${streamed.chars}` : 'off'}` +
       (clientCalls ? ` · EMULATED ${clientCalls.length}: ${clientCalls.map((c) => c.name).join(',')}` : '') +
       (hops ? ` · hops=${hops}` : '') +
       ` · ${usage.total_tokens} tok`,
@@ -1549,6 +1564,8 @@ async function handleChat(req, res) {
     outcome: truncated ? 'truncated' : 'ok',
     fallback: usedFallback || undefined,
     toolCalls: clientCalls ? clientCalls.length : 0,
+    stream: Boolean(body.stream),
+    streamedChars: streamed.chars,
     cache: usedCache || undefined,
   })
 
@@ -1579,15 +1596,10 @@ async function handleChat(req, res) {
     const text = content || ''
     if (!streamed.chars) {
       sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
-      for (let i = 0; i < text.length; i += 48) {
-        sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: text.slice(i, i + 48) }, finish_reason: null }] })
-      }
+      await sendContent(text)
     } else {
       // Everything up to streamed.chars already went out part by part.
-      const rest = text.slice(streamed.chars)
-      for (let i = 0; i < rest.length; i += 48) {
-        sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: rest.slice(i, i + 48) }, finish_reason: null }] })
-      }
+      await sendContent(text.slice(streamed.chars))
     }
     sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage })
     res.write('data: [DONE]\n\n')
