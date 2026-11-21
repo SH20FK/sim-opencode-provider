@@ -6,7 +6,8 @@
   "toolEmulation": true,
   "toolTemperature": 0,
   "maxConcurrent": 0,
-  "requestTimeoutMs": 290000,
+  "requestTimeoutMs": 320000,
+  "simTimeoutSec": 300,
   "fallbackModel": "",
   "cache": {
     "enabled": true,

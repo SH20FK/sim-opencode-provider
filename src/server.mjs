@@ -29,7 +29,8 @@ const DEFAULTS = {
   toolEmulation: true,
   toolTemperature: 0,
   maxConcurrent: 0,
-  requestTimeoutMs: 290000,
+  requestTimeoutMs: 320000,
+  simTimeoutSec: 300,
   fallbackModel: '',
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
   proxyTools: { now: true, web_fetch: true },
@@ -68,6 +69,12 @@ function loadConfig() {
 
 const cfg = loadConfig()
 const SIM_API = 'https://www.sim.ai/api/v2'
+
+// Sim's execute endpoint cuts a call off at 120 s unless `timeoutSeconds` says
+// otherwise, and the plan caps that at 300. Our own abort has to stay above it
+// so Sim's error, not ours, is what the caller sees.
+const SIM_TIMEOUT_SEC = Math.min(300, Math.max(0, Number(cfg.simTimeoutSec) || 0))
+const CALL_TIMEOUT_MS = Math.max(Number(cfg.requestTimeoutMs) || 0, SIM_TIMEOUT_SEC * 1000 + 15000)
 
 const FALLBACK_MODELS = [
   'claude-sonnet-5-5', 'claude-opus-5', 'claude-sonnet-4-5', 'claude-opus-4-5', 'claude-haiku-4-5',
@@ -293,8 +300,9 @@ const CONTINUE_MARK = '<<<CONTINUE>>>'
 const FORMAT_RULE =
   'Formatting: answer in markdown with real line breaks. Never emit HTML tags such as <br>, <p> or <div>.'
 
-// Sim cuts a single tool call off after ~120 s, and answers that hit max_tokens
-// come back empty. So long answers are produced in parts and stitched together.
+// Sim cuts a single tool call off at its timeout (120 s by default, 300 s when
+// configured), and answers that hit max_tokens come back empty. So long answers
+// are produced in parts and stitched together.
 const DEFAULT_CHUNK = { words: 250, lines: 100 }
 const chunkSizes = new Map()
 const CHUNK_STATE = path.join(ROOT, 'chunk.state.json')
@@ -437,12 +445,16 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
     if (typeof temperature === 'number') input.temperature = temperature
     if (limit) input.maxTokens = limit
 
-    const body = JSON.stringify({ workspaceId: cfg.workspaceId, input })
+    const body = JSON.stringify({
+      workspaceId: cfg.workspaceId,
+      input,
+      ...(SIM_TIMEOUT_SEC > 0 ? { timeoutSeconds: SIM_TIMEOUT_SEC } : {}),
+    })
 
     await gate.acquire()
     try {
       await limiter.before()
-      const timeout = AbortSignal.timeout(cfg.requestTimeoutMs || 290000)
+      const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS)
       const composed = signal && AbortSignal.any ? AbortSignal.any([timeout, signal]) : timeout
       const res = await fetch(`${SIM_API}/tools/llm_chat/execute`, {
         method: 'POST',
@@ -494,7 +506,7 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
           'tool failed'
         const text = typeof msg === 'string' ? msg : JSON.stringify(msg)
         const err = new Error(`Sim model error: ${text}`)
-        // Sim cuts a model call off after ~120 s and reports it as a failed run.
+        // Sim cuts a model call off at its timeout and reports it as a failed run.
         // "Provider X is not available" is permanent: the model exists in the
         // catalogue but cannot be reached, so it must not be swapped silently.
         const timedOut = /timed?\s?out|timeout/i.test(text)
@@ -1352,7 +1364,9 @@ async function handleChat(req, res) {
           }
         }
 
-        // Nudge: model produced something that looks like a broken call.
+        // Nudge: model produced something that looks like a broken call. The
+        // retry goes through the chunked path too: a plain simChat here would
+        // hit Sim's per-call limit with no way to shrink the answer.
         if (emulation && !calls && cfg.nudge.enabled && looksLikeFailedCall(content)) {
           let fixed = false
           for (let attempt = 0; attempt < (cfg.nudge.maxRetries || 1) && !fixed; attempt++) {
@@ -1360,7 +1374,14 @@ async function handleChat(req, res) {
             workingContext +=
               `\n\n[assistant]\n${content}\n\n[user]\nThat reply was not a valid tool call. ` +
               'Reply with ONLY the JSON object {"tool_calls":[{"name":...,"arguments":{...}}]} and nothing else.'
-            const retry = await simChat({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
+            let retry
+            try {
+              retry = await simChatChunked({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
+            } catch (err) {
+              stats.nudgeFailures = (stats.nudgeFailures || 0) + 1
+              log(`nudge retry for ${model} failed: ${short(err.message, 160)}`)
+              break
+            }
             bump(model, Date.now() - startedAll, (retry.tokens && retry.tokens.input) || 0, (retry.tokens && retry.tokens.output) || 0)
             content = retry.content
             tokens = retry.tokens
@@ -1382,10 +1403,22 @@ async function handleChat(req, res) {
           workingContext +=
             `\n\n[assistant]\n${JSON.stringify({ tool_calls: calls })}\n\n[user]\nThose exact calls already ran and their results are above. Do not repeat them; continue with the answer.`
           stats.nudges++
-          const retry = await simChat({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
-          content = retry.content
-          tokens = retry.tokens
+          let retry = null
+          try {
+            retry = await simChatChunked({ model, systemPrompt, context: workingContext, temperature, maxTokens, signal: controller.signal })
+          } catch (err) {
+            stats.nudgeFailures = (stats.nudgeFailures || 0) + 1
+            log(`dedup retry for ${model} failed: ${short(err.message, 160)}`)
+          }
           calls = null
+          if (retry) {
+            bump(model, Date.now() - startedAll, (retry.tokens && retry.tokens.input) || 0, (retry.tokens && retry.tokens.output) || 0)
+            content = retry.content
+            tokens = retry.tokens
+          } else {
+            // Never hand the client the same tool calls again: it would run them twice.
+            content = 'Не удалось продолжить после повторного вызова инструмента. Попробуй ещё раз.'
+          }
           break
         }
         calls = fresh
@@ -1436,7 +1469,7 @@ async function handleChat(req, res) {
     let msg = String((err && err.message) || err)
     if (err && err.code === 'TIMEOUT') {
       msg =
-        `Sim stopped the call to ${model} after ~120 s (its per-call limit). ` +
+        `Sim stopped the call to ${model} after ~${SIM_TIMEOUT_SEC || 120} s (its per-call limit). ` +
         'The model was still generating a long answer. Ask for a smaller chunk, or switch to a faster model.'
     }
     if (err && err.code === 'UNAVAILABLE') {
@@ -1611,6 +1644,7 @@ const server = http.createServer(async (req, res) => {
       proxyTools: Object.keys(cfg.proxyTools || {}).filter((k) => cfg.proxyTools[k]),
       cache: cfg.cache.enabled,
       maxConcurrent: cfg.maxConcurrent,
+      simTimeoutSec: SIM_TIMEOUT_SEC,
     })
   }
 
@@ -1683,7 +1717,7 @@ server.on('error', (err) => {
 })
 
 server.listen(cfg.port, '127.0.0.1', () => {
-  log(`sim proxy v2 on http://127.0.0.1:${cfg.port}/v1 · models=${models.hosted.length} · emulation=${cfg.toolEmulation} · cache=${cfg.cache.enabled}`)
+  log(`sim proxy v2 on http://127.0.0.1:${cfg.port}/v1 · models=${models.hosted.length} · emulation=${cfg.toolEmulation} · cache=${cfg.cache.enabled} · call timeout=${SIM_TIMEOUT_SEC || 'default'}s`)
 })
 
 setInterval(refreshModels, 12 * 3600 * 1000).unref?.()

@@ -71,7 +71,8 @@ function banner(subtitle = 'free hosted models | tool-calling emulation | local 
 // ------------------------------------------------------------------ helpers
 const DEFAULTS = {
   simApiKey: '', workspaceId: '', workflowId: '', port: 8787,
-  toolEmulation: true, toolTemperature: 0, maxConcurrent: 2, requestTimeoutMs: 290000,
+  toolEmulation: true, toolTemperature: 0, maxConcurrent: 2, requestTimeoutMs: 320000,
+  simTimeoutSec: 300,
   fallbackModel: '',
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
   proxyTools: { now: true, web_fetch: true },
@@ -400,6 +401,7 @@ async function showStatus(cfg) {
   const avg = st.chatRequests ? Math.round((st.latencyMs || 0) / st.chatRequests) : 0
   console.log(`\n  ${paint('green', 'работает')}  uptime ${Math.floor(health.uptimeSec / 60)} мин  ·  порт ${cfg.port}`)
   console.log(`  моделей ${health.models}  ·  эмуляция тулов ${health.toolEmulation ? 'вкл' : 'выкл'}  ·  кеш ${health.cache ? 'вкл' : 'выкл'}`)
+  if (health.simTimeoutSec) console.log(`  вызов Sim до ${health.simTimeoutSec} с`)
   console.log(`  свои тулы: ${(health.proxyTools || []).join(', ') || '—'}`)
   console.log(
     `  запросов ${st.chatRequests || 0}  ·  тул-вызовов ${st.emulatedToolCalls || 0}  ·  своих ${st.proxyToolRuns || 0}` +
