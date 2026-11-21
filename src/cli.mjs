@@ -478,6 +478,11 @@ async function runBenchCommand(cfg, args = []) {
     : all
       ? ((await proxyFetch(cfg, '/v1/models?all=1')).body.data || []).map((m) => m.id)
       : opencode.MODELS.map((m) => m.id)
+  if (!modelsArg && !all) {
+    // Bench only what the catalogue still serves: ids linger after Sim removes a model.
+    const hosted = ((await proxyFetch(cfg, '/v1/models')).body.data || []).map((m) => m.id)
+    if (hosted.length) models = models.filter((id) => hosted.includes(id))
+  }
   if (limitArg) models = models.slice(0, limitArg)
 
   if (!models.length) {

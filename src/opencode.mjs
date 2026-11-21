@@ -30,7 +30,6 @@ export const MODELS = [
   { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code (Sim)', context: 262144, output: 32768 },
   { id: 'glm-5.3', name: 'GLM 5.3 (Sim)', context: 1000000, output: 131072 },
   { id: 'glm-5.3-flash', name: 'GLM 5.3 Flash (Sim)', context: 1000000, output: 131072 },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro (Sim)', context: 1000000, output: 128000 },
   { id: 'claude-fable-5-2', name: 'Claude Fable 5.2 (Sim)', context: 1000000, output: 128000 },
   { id: 'claude-fable-5-1', name: 'Claude Fable 5.1 (Sim)', context: 1000000, output: 128000 },
   { id: 'claude-fable-5', name: 'Claude Fable 5 (Sim)', context: 1000000, output: 128000 },
