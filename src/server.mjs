@@ -14,7 +14,7 @@ import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createRateLimiter } from './ratelimit.mjs'
 import { sanitizeModelText, hasBrFlood } from './sanitize.mjs'
-import { normalizeCalls, extractCallLines, extractJsonCalls, extractXmlCalls, stripToolArtifacts } from './toolcalls.mjs'
+import { normalizeCalls, extractCallLines, extractJsonCalls, extractXmlCalls, extractBareInvokes, stripToolArtifacts } from './toolcalls.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
@@ -686,7 +686,7 @@ function repairCalls(calls, tools) {
 }
 
 const looksLikeFailedCall = (text) =>
-  /<invoke|<invoke_tool|tool_calls|"arguments"|_call:|```json/i.test(text) && text.length < 4000
+  /<invoke|<invoke_tool|invoke:|invoke_tool:|tool_calls|"arguments"|_call:|```json/i.test(text) && text.length < 4000
 
 function canonCall(call) {
   try {
@@ -1265,7 +1265,7 @@ async function handleChat(req, res) {
 
         calls = null
         if (emulation) {
-          calls = extractJsonCalls(content, tools) || extractXmlCalls(content, tools) || extractCallLines(content, tools)
+          calls = extractJsonCalls(content, tools) || extractXmlCalls(content, tools) || extractCallLines(content, tools) || extractBareInvokes(content, tools)
           if (calls) {
             calls = repairCalls(calls, tools)
             content = stripToolArtifacts(content)
@@ -1293,7 +1293,7 @@ async function handleChat(req, res) {
             bump(model, Date.now() - startedAll, (retry.tokens && retry.tokens.input) || 0, (retry.tokens && retry.tokens.output) || 0)
             content = retry.content
             tokens = retry.tokens
-            calls = extractJsonCalls(content, tools) || extractXmlCalls(content, tools) || extractCallLines(content, tools)
+            calls = extractJsonCalls(content, tools) || extractXmlCalls(content, tools) || extractCallLines(content, tools) || extractBareInvokes(content, tools)
             if (calls) {
               calls = repairCalls(calls, tools)
               content = stripToolArtifacts(content)
