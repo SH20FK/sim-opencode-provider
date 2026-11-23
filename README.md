@@ -1,10 +1,61 @@
 # sim-opencode-provider
 
+> ## ⛔ Не работает с 23 ноября 2026
+>
+> Sim закрыл hosted-ключи на бесплатном плане. Любая модель теперь отвечает:
+>
+> ```
+> <model> with Sim's hosted key is available on paid plans.
+> Upgrade your plan, or add your own API key under Settings > BYOK.
+> ```
+>
+> Проверено: 12 моделей подряд (Claude, GPT, Gemini, Grok, Kimi, GLM) и workflow-агент — отказ
+> у всех. Кредиты при этом на месте (997/1000), план `free`, `active`, так что это смена политики
+> Sim, а не исчерпанный лимит.
+>
+> Проект остаётся рабочим только в двух случаях:
+> — **BYOK**: свои ключи провайдеров, в настройках Sim (Settings → BYOK) или в `config.json` → `"byok"`;
+> — **платный план Sim** или self-host.
+>
+> Если ключей нет, проще ходить в OpenCode к провайдеру напрямую (Google AI Studio, Groq,
+> OpenRouter) — там нативный стриминг и tool calling, без прослойки. Подробнее — в разделе
+> [«Статус»](#статус).
+
 Hosted-модели Sim в OpenCode. Локальный OpenAI-совместимый прокси + эмуляция tool calling, чтобы агент реально читал файлы, запускал команды и правил код.
 
 ```
 OpenCode ──▶ 127.0.0.1:8787 ──▶ Sim /api/v2/tools/llm_chat/execute
 ```
+
+## Статус
+
+**23.11.2026 — бесплатный доступ к hosted-моделям закрыт.**
+
+Что проверено на живом API:
+
+| проверка | результат |
+|---|---|
+| `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-2` | `available on paid plans` |
+| `gpt-5.4`, `gpt-5.4-mini`, `gemini-3.8-flash`, `grok-4.7` | то же |
+| `kimi-k3`, `glm-5.3` | то же |
+| `deepseek-v4-pro` | `Provider "deepseek" is not available` |
+| workflow-агент (`executeWorkflow`) | то же сообщение про paid plans |
+| `billing/status` | план `free`, `active`, кредитов 997/1000 |
+
+Воркфлоу не помогает: модель внутри Agent-блока ходит через тот же hosted-ключ.
+
+Варианты, если проект ещё нужен:
+
+1. **BYOK в Sim** — Settings → BYOK, ключ Anthropic / OpenAI / Google. Модели идут на твоём ключе.
+2. **BYOK в прокси** — `config.json`:
+   ```json
+   "byok": { "claude-sonnet-5-5": "sk-ant-…" }
+   ```
+   Прокси передаст ключ в `llm_chat` (`input.apiKey`), настройки Sim трогать не надо.
+3. **Платный план Sim** или **self-host** (Sim open source, docker-compose, ключи свои).
+4. **Напрямую в OpenCode** к бесплатному провайдеру (Google AI Studio, Groq, OpenRouter) — без этого прокси.
+
+Ошибка теперь возвращается как `402` с внятным текстом, а не `502`.
 
 ## Запуск
 
