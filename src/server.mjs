@@ -34,6 +34,7 @@ const DEFAULTS = {
   simTimeoutSec: 300,
   fallbackModel: '',
   cache: { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608, persist: true, ttlByModel: {} },
+  byok: {},
   streamPacing: { enabled: false, chunkChars: 12, delayMs: 20 },
   proxyTools: { now: true, web_fetch: true },
   nudge: { enabled: true, maxRetries: 2 },
@@ -449,6 +450,9 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
     if (systemPrompt) input.systemPrompt = systemPrompt
     if (typeof temperature === 'number') input.temperature = temperature
     if (limit) input.maxTokens = limit
+    // Hosted models need a paid plan; with a provider key they run on that key.
+    const byokKey = cfg.byok && cfg.byok[model]
+    if (byokKey) input.apiKey = byokKey
 
     const body = JSON.stringify({
       workspaceId: cfg.workspaceId,
@@ -517,6 +521,14 @@ async function simChat({ model, systemPrompt, context, temperature, maxTokens, s
           text = (parsed.error && parsed.error.message) || parsed.message || text
         } catch {}
         text = String(text)
+        // Sim now gates every hosted model behind a paid plan; a provider key
+        // (BYOK) or an upgrade is the only way through.
+        if (/available on paid plans|upgrade your plan|settings\s*>\s*byok/i.test(text)) {
+          const err = new Error(`Sim model error: ${text}`)
+          err.code = 'PAID_ONLY'
+          err.status = 402
+          throw err
+        }
         // Upstream 500s ("Internal server error", overloaded) are transient: one
         // or two retries usually get through, and failing the whole turn is worse.
         const transient = /internal server error|overloaded|service unavailable|temporarily|try again/i.test(text)
@@ -1253,6 +1265,7 @@ async function handleChat(req, res) {
           // A permanently unavailable model is not a reason to answer as another one.
           const retryable =
             err.code !== 'UNAVAILABLE' &&
+            err.code !== 'PAID_ONLY' &&
             (status === 402 || status === 404 || status === 429 || status >= 500 || err.code === 'TIMEOUT')
           if (cfg.fallbackModel && cfg.fallbackModel !== model && retryable) {
             stats.fallbacks++
@@ -1393,21 +1406,28 @@ async function handleChat(req, res) {
     if (err && err.code === 'UNAVAILABLE') {
       msg = `${model} is not available on Sim right now (${msg.replace(/^Sim model error:\s*/, '')}). Pick another model.`
     }
+    if (err && err.code === 'PAID_ONLY') {
+      msg =
+        `Sim closed the hosted key for every model on the free plan: ${model} needs a paid plan or your own provider key. ` +
+        `Add a key under Settings → BYOK in Sim, or set byok["${model}"] in config.json.`
+    }
     stats.errorsByCode = stats.errorsByCode || {}
     log(`chat ${model} FAILED in ${Date.now() - startedAll}ms: ${short(msg, 240)}`)
     rememberError(msg)
     const status =
-      err && err.code === 'TIMEOUT'
-        ? 504
-        : err && err.code === 'UNAVAILABLE'
-          ? 404
-          : /no longer available|not found|unknown model/i.test(msg)
+      err && err.code === 'PAID_ONLY'
+        ? 402
+        : err && err.code === 'TIMEOUT'
+          ? 504
+          : err && err.code === 'UNAVAILABLE'
             ? 404
-            : /api key is required|unauthorized/i.test(msg)
-              ? 401
-              : /402|credit/i.test(msg)
-                ? 402
-                : 502
+            : /no longer available|not found|unknown model/i.test(msg)
+              ? 404
+              : /api key is required|unauthorized/i.test(msg)
+                ? 401
+                : /402|credit|paid plan/i.test(msg)
+                  ? 402
+                  : 502
     if (body.stream && res.headersSent) {
       sendSse(res, { error: { message: msg, type: 'upstream_error' } })
       res.write('data: [DONE]\n\n')

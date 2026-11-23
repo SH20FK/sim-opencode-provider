@@ -22,6 +22,7 @@
     "chunkChars": 12,
     "delayMs": 20
   },
+  "byok": {},
   "proxyTools": {
     "now": true,
     "web_fetch": true
